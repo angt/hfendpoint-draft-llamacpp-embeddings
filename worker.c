@@ -1,7 +1,12 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <poll.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +23,7 @@
 
 static struct {
     char name[128];
-    const char *model_path;
+    const char *gguf;
     struct {
         int req;
         int rep;
@@ -27,6 +32,7 @@ static struct {
     struct llama_context *ctx;
     int n_ctx;
     int n_batch;
+    int n_threads;
     llama_token add_bos;
     llama_token *tokens;
     const struct llama_vocab *vocab;
@@ -288,69 +294,48 @@ process_data(msgpack_unpacker *unpacker, int fd)
 
     msgpack_unpacker_buffer_consumed(unpacker, bytes);
     msgpack_unpacked result;
-    msgpack_unpacked_init(&result);
-    int ret;
 
-    while (ret = msgpack_unpacker_next(unpacker, &result),
-           ret == MSGPACK_UNPACK_SUCCESS) {
-        dispatch_request(result.data);
-        msgpack_unpacked_destroy(&result);
+    for (;;) {
         msgpack_unpacked_init(&result);
-    }
-    if (result.zone)
+
+        int ret = msgpack_unpacker_next(unpacker, &result);
+
+        if (ret == MSGPACK_UNPACK_SUCCESS)
+            dispatch_request(result.data);
+
         msgpack_unpacked_destroy(&result);
 
-    if (ret == MSGPACK_UNPACK_PARSE_ERROR) {
-        LOG_ERR("Msgpack parse error. Resetting unpacker.");
-        msgpack_unpacker_reset(unpacker);
-    } else if (ret != MSGPACK_UNPACK_CONTINUE) {
-        LOG_ERR("Unexpected unpacker state: %d", ret);
-        return -1;
-    }
-    return 0;
-}
+        if (ret == MSGPACK_UNPACK_CONTINUE)
+            break;
 
-static int
-parse_args(int argc, char **argv)
-{
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--model") == 0) {
-            if (++i < argc) {
-                worker.model_path = argv[i];
-            } else {
-                LOG_ERR("Option %s requires argument", argv[i-1]);
-                return 1;
-            }
-        } else {
-            LOG_ERR("Unknown argument: %s", argv[i]);
-            return 1;
+        if (ret == MSGPACK_UNPACK_PARSE_ERROR) {
+            LOG_ERR("Msgpack parse error. Resetting unpacker.");
+            msgpack_unpacker_reset(unpacker);
+            break;
+        }
+        if (ret != MSGPACK_UNPACK_SUCCESS) {
+            LOG_ERR("Unexpected unpacker state: %d", ret);
+            return -1;
         }
     }
-    if (!worker.model_path) {
-        LOG_ERR("Model path is required, use -m MODEL");
-        return 1;
-    }
     return 0;
 }
 
 static int
-parse_fd_env(const char *name)
+parse_int(const char *val, int def)
 {
-    const char *val = getenv(name);
+    if (!val)
+        return def;
 
-    if (!val) {
-        LOG_ERR("Missing env var %s", name);
-        return -1;
-    }
     char *end;
     errno = 0;
-    long fd = strtol(val, &end, 10);
+    long x = strtol(val, &end, 10);
 
-    if (errno || end==val || *end != '\0' || fd < 0 || fd > INT_MAX) {
-        LOG_ERR("Invalid fd number in env %s=%s", name, val);
-        return -1;
+    if (errno || end == val || *end != '\0' || x < 0 || x > INT_MAX) {
+        LOG_ERR("Invalid integer in `%s`", val);
+        return def;
     }
-    return (int)fd;
+    return (int)x;
 }
 
 static int
@@ -373,19 +358,22 @@ static int
 setup_llama(void)
 {
     struct llama_model_params model_params = llama_model_default_params();
-    // TODO
-    worker.model = llama_model_load_from_file(worker.model_path, model_params);
+    model_params.use_mmap = 1;
+    worker.model = llama_model_load_from_file(worker.gguf, model_params);
 
     if (!worker.model) {
-        LOG_ERR("Couldn't load model `%s`", worker.model_path);
+        LOG_ERR("Couldn't load model `%s`", worker.gguf);
         return 1;
     }
     llama_model_desc(worker.model, worker.name, sizeof(worker.name) - 1);
 
     struct llama_context_params ctx_params = llama_context_default_params();
-    // TODO
-    ctx_params.embeddings = 1;
-    ctx_params.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+    ctx_params.n_ctx           = worker.n_ctx;
+    ctx_params.n_batch         = worker.n_batch;
+    ctx_params.n_threads       = worker.n_threads;
+    ctx_params.n_threads_batch = worker.n_threads;
+    ctx_params.embeddings      = 1;
+    ctx_params.pooling_type    = LLAMA_POOLING_TYPE_MEAN;
     worker.ctx = llama_init_from_model(worker.model, ctx_params);
 
     if (!worker.ctx) {
@@ -438,21 +426,61 @@ setup_llama(void)
 }
 
 static int
+get_n_threads(void)
+{
+#if __linux__
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+
+    if (sched_getaffinity(0, sizeof(cpu_set_t), &mask)) {
+        LOG_ERR("Failed sched_getaffinity() (errno %d)", errno);
+        return 1;
+    }
+    int count = 0;
+
+    for (int i = 0; i < CPU_SETSIZE; ++i) {
+        if (CPU_ISSET(i, &mask))
+            count++;
+    }
+    if (count <= 0) {
+        LOG_ERR("Couldn't find the number of threads");
+        return 1;
+    }
+    LOG("Detected %d threads", count);
+    return count;
+#else
+    return 1;
+#endif
+}
+
+static int
 setup(int argc, char **argv)
 {
     llama_backend_init();
 
-    if (parse_args(argc, argv))
+    worker.fd.req = parse_int(getenv("HFENDPOINT_FD_REQUEST"), -1);
+    worker.fd.rep = parse_int(getenv("HFENDPOINT_FD_REPLY"), -1);
+
+    if (worker.fd.req == -1 || worker.fd.rep == -1) {
+        LOG_ERR("Run this binary from hfendpoint");
         return 1;
-
-    worker.fd.req = parse_fd_env("HFENDPOINT_FD_REQUEST");
-    worker.fd.rep = parse_fd_env("HFENDPOINT_FD_REPLY");
-
-    if (worker.fd.req == -1 || worker.fd.rep == -1)
-        return 1;
-
+    }
     if (set_nonblock(worker.fd.req))
         return 1;
+
+    worker.n_threads = parse_int(getenv("HFENDPOINT_THREADS"), -1);
+
+    if (worker.n_threads <= 0)
+        worker.n_threads = get_n_threads();
+
+    worker.gguf = getenv("HFENDPOINT_GGUF");
+
+    if (!worker.gguf) {
+        LOG_ERR("HFENDPOINT_GGUF is required");
+        return 1;
+    }
+    worker.n_ctx   = parse_int(getenv("HFENDPOINT_CTX"), 0);
+    worker.n_batch = parse_int(getenv("HFENDPOINT_BATCH"), 0);
 
     return setup_llama();
 }

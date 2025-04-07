@@ -1,4 +1,4 @@
-CFLAGS = -O3 -Wall -march=native -mcpu=native
+CFLAGS = -O2 -Wall
 
 CFLAGS  += $(shell pkg-config --cflags llama)
 LDFLAGS += $(shell pkg-config --libs-only-L llama)
