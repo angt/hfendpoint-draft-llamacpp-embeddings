@@ -6,6 +6,8 @@ ARG TARGETARCH
 ARG llamacpp_version=b5061
 ARG llamacpp_native=ON
 ARG llamacpp_cpu_arm_arch=native
+ARG llamacpp_backend_dl=OFF
+ARG llamacpp_cpu_all_variants=OFF
 ARG msgpack_version=6.1.0
 ARG hfendpoint_version=0.1.0
 
@@ -28,6 +30,8 @@ RUN tar -xzf ${llamacpp_version}.tar.gz \
         -DCMAKE_INSTALL_PREFIX=/usr \
         -DGGML_NATIVE=${llamacpp_native} \
         -DGGML_CPU_ARM_ARCH=${llamacpp_cpu_arm_arch} \
+        -DGGML_BACKEND_DL=${llamacpp_backend_dl} \
+        -DGGML_CPU_ALL_VARIANTS=${llamacpp_cpu_all_variants} \
         -DLLAMA_BUILD_COMMON=OFF \
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_EXAMPLES=OFF \
