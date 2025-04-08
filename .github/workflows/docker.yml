@@ -4,12 +4,14 @@ on:
   push:
     branches:
       - master
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+
     steps:
       - uses: actions/checkout@v4
 
@@ -34,3 +36,6 @@ jobs:
           source: .
           targets: default
           push: true
+          set: |
+            amd64.tags=ghcr.io/${{ github.repository }}:amd64-latest
+            arm64-graviton4.tags=ghcr.io/${{ github.repository }}:arm64-graviton4-latest

@@ -1,14 +1,17 @@
+variable "image_name" {
+  default = "hfendpoint-draft-llamacpp-embeddings"
+}
+
 group "default" {
-  targets = ["image-amd64-generic", "image-arm64-graviton4"]
+  targets = ["amd64", "arm64-graviton4"]
 }
 
 target "base" {
   dockerfile = "Dockerfile"
   context    = "."
-  tags = ["ghcr.io/angt/hfendpoint-draft-llamacpp-embeddings:latest"]
 }
 
-target "image-amd64-generic" {
+target "amd64" {
   inherits  = ["base"]
   platforms = ["linux/amd64"]
   args = {
@@ -17,11 +20,12 @@ target "image-amd64-generic" {
     llamacpp_backend_dl       = "ON"
     llamacpp_cpu_all_variants = "ON"
   }
-  cache-from = ["type=gha,scope=amd64-generic"]
-  cache-to   = ["type=gha,mode=max,scope=amd64-generic"]
+  tags       = ["${image_name}:amd64-latest"]
+  cache-from = ["type=gha,scope=${image_name}-amd64"]
+  cache-to   = ["type=gha,mode=max,scope=${image_name}-amd64"]
 }
 
-target "image-arm64-graviton4" {
+target "arm64-graviton4" {
   inherits  = ["base"]
   platforms = ["linux/arm64"]
   args = {
@@ -30,6 +34,7 @@ target "image-arm64-graviton4" {
     llamacpp_backend_dl       = "OFF"
     llamacpp_cpu_all_variants = "OFF"
   }
-  cache-from = ["type=gha,scope=arm64-graviton4"]
-  cache-to   = ["type=gha,mode=max,scope=arm64-graviton4"]
+  tags       = ["${image_name}:arm64-graviton4-latest"]
+  cache-from = ["type=gha,scope=${image_name}-arm64"]
+  cache-to   = ["type=gha,mode=max,scope=${image_name}-arm64"]
 }
