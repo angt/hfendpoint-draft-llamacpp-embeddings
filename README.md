@@ -15,4 +15,5 @@ You'll need the following:
 
 ## Run
 
-    hfendpoint -- ./worker -m <MODEL.gguf>
+    export HFENDPOINT_GGUF=model.gguf
+    hfendpoint -- ./worker
