@@ -24,10 +24,7 @@
 static struct {
     char name[128];
     const char *gguf;
-    struct {
-        int req;
-        int rep;
-    } fd;
+    int fd;
     struct llama_model *model;
     struct llama_context *ctx;
     int n_ctx;
@@ -40,7 +37,7 @@ static struct {
     enum llama_pooling_type pool_type;
     int use_encode;
 } worker = {
-    .fd = { .req = -1, .rep = -1},
+    .fd = -1,
 };
 
 struct embeddings {
@@ -101,13 +98,26 @@ reply(uint64_t id, struct embeddings *embds)
             msgpack_pack_nil(&packer);
         }
     }
-    ssize_t written = write(worker.fd.rep, buffer.data, buffer.size);
+    ssize_t written = 0;
+    size_t remaining = buffer.size;
 
-    if (written < 0) {
-        LOG_ERR("Failed write() (errno %d)", errno);
-    } else if (buffer.size != (size_t)written) {
-        LOG_ERR("Couldn't write full reply (written %zd, wanted %zu)",
-            written, buffer.size);
+    while (remaining) {
+        ssize_t ret = write(worker.fd, buffer.data + written, remaining);
+
+        if (ret == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd = {
+                    .fd = worker.fd,
+                    .events = POLLOUT
+                };
+                poll(&pfd, 1, -1);
+                continue;
+            }
+            LOG_ERR("Failed write() (errno %d)", errno);
+            break;
+        }
+        written += ret;
+        remaining -= ret;
     }
     msgpack_sbuffer_destroy(&buffer);
 }
@@ -268,7 +278,7 @@ read_data(int fd, void *buffer, size_t size)
     ssize_t bytes = read(fd, buffer, size);
 
     if (bytes < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
             return 0;
 
         LOG_ERR("Failed read() (fd %d, errno %d)", fd, errno);
@@ -458,14 +468,13 @@ setup(int argc, char **argv)
 {
     llama_backend_init();
 
-    worker.fd.req = parse_int(getenv("HFENDPOINT_FD_REQUEST"), -1);
-    worker.fd.rep = parse_int(getenv("HFENDPOINT_FD_REPLY"), -1);
+    worker.fd = parse_int(getenv("HFENDPOINT_FD"), -1);
 
-    if (worker.fd.req == -1 || worker.fd.rep == -1) {
+    if (worker.fd == -1) {
         LOG_ERR("Run this binary from hfendpoint");
         return 1;
     }
-    if (set_nonblock(worker.fd.req))
+    if (set_nonblock(worker.fd))
         return 1;
 
     worker.n_threads = parse_int(getenv("HFENDPOINT_THREADS"), -1);
@@ -514,7 +523,7 @@ main(int argc, char **argv)
         return cleanup(EXIT_FAILURE);
     }
     struct pollfd pfd = {
-        .fd = worker.fd.req,
+        .fd = worker.fd,
         .events = POLLIN
     };
     int exit_code = EXIT_FAILURE;
