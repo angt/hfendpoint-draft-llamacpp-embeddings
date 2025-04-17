@@ -30,7 +30,6 @@ static struct {
     struct llama_context *ctx;
     int n_ctx;
     int n_batch;
-    int n_ubatch;
     int n_threads;
     llama_token add_bos;
     llama_token *tokens;
@@ -422,7 +421,6 @@ setup_llama(void)
     struct llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx           = worker.n_ctx;
     ctx_params.n_batch         = worker.n_batch;
-    ctx_params.n_ubatch        = worker.n_ubatch;
     ctx_params.n_threads       = worker.n_threads;
     ctx_params.n_threads_batch = worker.n_threads;
     ctx_params.embeddings      = 1;
@@ -531,9 +529,8 @@ setup(int argc, char **argv)
         LOG_ERR("HFENDPOINT_GGUF is required");
         return 1;
     }
-    worker.n_ctx    = parse_int(getenv("HFENDPOINT_CTX"), 0);
-    worker.n_batch  = parse_int(getenv("HFENDPOINT_BATCH"), 0);
-    worker.n_ubatch = parse_int(getenv("HFENDPOINT_UBATCH"), 0);
+    worker.n_ctx   = parse_int(getenv("HFENDPOINT_CTX"), 0);
+    worker.n_batch = parse_int(getenv("HFENDPOINT_BATCH"), 0);
 
     return setup_llama();
 }
