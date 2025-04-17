@@ -37,6 +37,7 @@ static struct {
     int32_t n_embd;
     enum llama_pooling_type pool_type;
     int use_encode;
+    struct llama_batch batch;
 } worker = {
     .fd = -1,
 };
@@ -168,12 +169,9 @@ handle_request(uint64_t id, msgpack_object input)
         .size = input.via.array.size
     };
     int seqs[MAX_SIZE] = {0};
-    struct llama_batch batch = llama_batch_init(worker.n_batch, 0, 1);
 
-    if (!batch.token) {
-        LOG_ERR("Failed llama_batch_init() (req %" PRIu64 ")", id);
-        return;
-    }
+    worker.batch.n_tokens = 0;
+
     for (size_t i = 0; i < embds.size; i++) {
         llama_kv_self_seq_rm(worker.ctx, i, -1, -1);
     }
@@ -195,28 +193,27 @@ handle_request(uint64_t id, msgpack_object input)
                     "Batch size limit exceeded (max %d tokens). "
                     "Input sequence %zu requires %d tokens, but only %d space remaining in batch.",
                     worker.n_batch, i, n_tokens, worker.n_batch - pos);
-            llama_batch_free(batch);
             return;
         }
         for (int j = 0; j < n_tokens; j++) {
-            batch.token[pos] = worker.tokens[j];
-            batch.pos[pos] = j;
-            batch.n_seq_id[pos] = 1;
-            batch.seq_id[pos][0] = i;
-            batch.logits[pos] = 0;
+            worker.batch.token[pos] = worker.tokens[j];
+            worker.batch.pos[pos] = j;
+            worker.batch.n_seq_id[pos] = 1;
+            worker.batch.seq_id[pos][0] = i;
+            worker.batch.logits[pos] = 0;
             pos++;
         }
         if (n_tokens > 0)
-            batch.logits[pos - 1] = 1;
+            worker.batch.logits[pos - 1] = 1;
 
         seqs[i] = 1;
     }
-    batch.n_tokens = pos;
+    worker.batch.n_tokens = pos;
     embds.n_tokens = pos;
 
     if (pos) {
-        int rc = worker.use_encode ? llama_encode(worker.ctx, batch)
-                                   : llama_decode(worker.ctx, batch);
+        int rc = worker.use_encode ? llama_encode(worker.ctx, worker.batch)
+                                   : llama_decode(worker.ctx, worker.batch);
         if (rc) {
             LOG_ERR("Failed llama_%s() (req %" PRIu64 ", rc %d)",
                     worker.use_encode ? "encode" : "decode", id, rc);
@@ -228,7 +225,6 @@ handle_request(uint64_t id, msgpack_object input)
         }
     }
     reply(id, &embds);
-    llama_batch_free(batch);
 }
 
 static msgpack_object
@@ -474,6 +470,12 @@ setup_llama(void)
         LOG_ERR("Couldn't alloc %d tokens", worker.n_ctx);
         return 1;
     }
+    worker.batch = llama_batch_init(worker.n_batch, 0, 1);
+
+    if (!worker.batch.token) {
+        LOG_ERR("Failed llama_batch_init()");
+        return 1;
+    }
     return 0;
 }
 
@@ -550,6 +552,9 @@ setup(int argc, char **argv)
 static int
 cleanup(int exit_code)
 {
+    if (worker.batch.token)
+        llama_batch_free(worker.batch);
+
     if (worker.tokens)
         free(worker.tokens);
 
