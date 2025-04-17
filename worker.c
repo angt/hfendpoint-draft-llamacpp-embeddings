@@ -530,8 +530,8 @@ setup(int argc, char **argv)
         LOG_ERR("HFENDPOINT_GGUF is required");
         return 1;
     }
-    worker.n_ctx   = parse_int(getenv("HFENDPOINT_CTX"), 0);
-    worker.n_batch = parse_int(getenv("HFENDPOINT_BATCH"), 0);
+    worker.n_ctx   = parse_int(getenv("HFENDPOINT_CTX"), 512);
+    worker.n_batch = parse_int(getenv("HFENDPOINT_BATCH"), 512);
 
     return setup_llama();
 }
