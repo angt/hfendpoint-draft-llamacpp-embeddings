@@ -505,10 +505,21 @@ get_n_threads(void)
 #endif
 }
 
+static void
+log_callback(enum ggml_log_level level, const char *text, void *user_data) {
+    (void) user_data;
+    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
+        fprintf(stderr, "%s", text);
+    } else {
+        fprintf(stdout, "%s", text);
+    }
+}
+
 static int
 setup(int argc, char **argv)
 {
     llama_backend_init();
+    llama_log_set(log_callback, NULL);
 
     worker.fd = parse_int(getenv("HFENDPOINT_FD"), -1);
 
