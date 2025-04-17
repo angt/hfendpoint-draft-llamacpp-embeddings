@@ -421,6 +421,7 @@ setup_llama(void)
     struct llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx           = worker.n_ctx;
     ctx_params.n_batch         = worker.n_batch;
+    ctx_params.n_ubatch        = worker.n_batch;
     ctx_params.n_threads       = worker.n_threads;
     ctx_params.n_threads_batch = worker.n_threads;
     ctx_params.embeddings      = 1;
