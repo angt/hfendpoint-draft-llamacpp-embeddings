@@ -35,7 +35,7 @@ RUN tar -xzf ${llamacpp_version}.tar.gz \
         -DGGML_BACKEND_DL=${llamacpp_backend_dl} \
         -DGGML_CPU_ALL_VARIANTS=${llamacpp_cpu_all_variants} \
         -DGGML_CCACHE=OFF \
-        -DLLAMA_OPENMP=${llamacpp_openmp} \
+        -DGGML_OPENMP=${llamacpp_openmp} \
         -DLLAMA_BUILD_COMMON=OFF \
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_EXAMPLES=OFF \
