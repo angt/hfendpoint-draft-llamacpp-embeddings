@@ -7,6 +7,7 @@
 #include <inttypes.h>
 #include <poll.h>
 #include <sched.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,6 +65,61 @@ key_matches(msgpack_object key, const char *str)
 }
 
 static void
+send_buffer(msgpack_sbuffer *buffer)
+{
+    ssize_t written = 0;
+    size_t remaining = buffer->size;
+
+    while (remaining) {
+        ssize_t ret = write(worker.fd, buffer->data + written, remaining);
+
+        if (ret == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd = {
+                    .fd = worker.fd,
+                    .events = POLLOUT
+                };
+                poll(&pfd, 1, -1);
+                continue;
+            }
+            LOG_ERR("Failed write() (errno %d)", errno);
+            break;
+        }
+        written += ret;
+        remaining -= ret;
+    }
+}
+
+static void
+worker_error(uint64_t id, const char *fmt, ...)
+{
+    char error[1024];
+    va_list ap;
+
+    va_start(ap, fmt);
+    int ret = vsnprintf(error, sizeof(error), fmt, ap);
+    va_end(ap);
+
+    if (ret <= 0 || (size_t)ret >= sizeof(error)) {
+        LOG_ERR("Failed vsnprintf()");
+        return;
+    }
+    msgpack_sbuffer buffer;
+    msgpack_sbuffer_init(&buffer);
+    msgpack_packer packer;
+    msgpack_packer_init(&packer, &buffer, msgpack_sbuffer_write);
+
+    msgpack_pack_map(&packer, 2);
+    pack_string(&packer, "id");
+    msgpack_pack_uint64(&packer, id);
+    pack_string(&packer, "error");
+    pack_string(&packer, error);
+
+    send_buffer(&buffer);
+    msgpack_sbuffer_destroy(&buffer);
+}
+
+static void
 reply(uint64_t id, struct embeddings *embds)
 {
     msgpack_sbuffer buffer;
@@ -99,27 +155,7 @@ reply(uint64_t id, struct embeddings *embds)
             msgpack_pack_nil(&packer);
         }
     }
-    ssize_t written = 0;
-    size_t remaining = buffer.size;
-
-    while (remaining) {
-        ssize_t ret = write(worker.fd, buffer.data + written, remaining);
-
-        if (ret == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                struct pollfd pfd = {
-                    .fd = worker.fd,
-                    .events = POLLOUT
-                };
-                poll(&pfd, 1, -1);
-                continue;
-            }
-            LOG_ERR("Failed write() (errno %d)", errno);
-            break;
-        }
-        written += ret;
-        remaining -= ret;
-    }
+    send_buffer(&buffer);
     msgpack_sbuffer_destroy(&buffer);
 }
 
@@ -156,7 +192,12 @@ handle_request(uint64_t id, msgpack_object input)
         }
         if (pos + n_tokens > worker.n_batch) {
             LOG_ERR("Couldn't fit input in batch (req %" PRIu64 ", seq %zu)", id, i);
-            continue;
+            worker_error(id,
+                    "Batch size limit exceeded (max %d tokens). "
+                    "Input sequence %zu requires %d tokens, but only %d space remaining in batch.",
+                    worker.n_batch, i, n_tokens, worker.n_batch - pos);
+            llama_batch_free(batch);
+            return;
         }
         for (int j = 0; j < n_tokens; j++) {
             batch.token[pos] = worker.tokens[j];
