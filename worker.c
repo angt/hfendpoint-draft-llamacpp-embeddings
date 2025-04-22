@@ -17,7 +17,7 @@
 #include <msgpack.h>
 
 #define BUFFER_SIZE 4096U
-#define MAX_SIZE    128U
+#define BATCH_SIZE   128U
 
 #define LOG(format, ...)     fprintf(stdout, format "\n", ##__VA_ARGS__)
 #define LOG_ERR(format, ...) fprintf(stderr, format "\n", ##__VA_ARGS__)
@@ -28,24 +28,26 @@ static struct {
     int fd;
     struct llama_model *model;
     struct llama_context *ctx;
+    int batch_size;
     int n_ctx;
     int n_batch;
     int n_threads;
     llama_token add_bos;
-    llama_token *tokens;
     const struct llama_vocab *vocab;
     int32_t n_embd;
     enum llama_pooling_type pool_type;
     int use_encode;
     struct llama_batch batch;
+    llama_token *tokens[BATCH_SIZE];
+    float *embds[BATCH_SIZE];
 } worker = {
     .fd = -1,
 };
 
 struct embeddings {
     size_t size;
-    uint32_t n_tokens;
-    float *list[MAX_SIZE];
+    uint32_t total_tokens;
+    unsigned char ok[BATCH_SIZE];
 };
 
 static void
@@ -138,18 +140,17 @@ reply(uint64_t id, struct embeddings *embds)
     pack_string(&packer, "usage");
     msgpack_pack_map(&packer, 2);
     pack_string(&packer, "prompt_tokens");
-    msgpack_pack_uint32(&packer, embds->n_tokens);
+    msgpack_pack_uint32(&packer, embds->total_tokens);
     pack_string(&packer, "total_tokens");
-    msgpack_pack_uint32(&packer, embds->n_tokens);
+    msgpack_pack_uint32(&packer, embds->total_tokens);
     pack_string(&packer, "embeddings");
     msgpack_pack_array(&packer, embds->size);
 
     for (size_t i = 0; i < embds->size; i++) {
-        float *embd = embds->list[i];
-        if (embd) {
+        if (embds->ok[i]) {
             msgpack_pack_array(&packer, worker.n_embd);
             for (int j = 0; j < worker.n_embd; j++) {
-                msgpack_pack_float(&packer, embd[j]);
+                msgpack_pack_float(&packer, worker.embds[i][j]);
             }
         } else {
             msgpack_pack_nil(&packer);
@@ -168,61 +169,104 @@ handle_request(uint64_t id, msgpack_object input)
     struct embeddings embds = {
         .size = input.via.array.size
     };
-    int seqs[MAX_SIZE] = {0};
-
-    worker.batch.n_tokens = 0;
-
-    for (size_t i = 0; i < embds.size; i++) {
-        llama_kv_self_seq_rm(worker.ctx, i, -1, -1);
-    }
-    int pos = 0;
+    struct {
+        int n_tokens;
+        int processed;
+    } seqs[BATCH_SIZE] = {0};
 
     for (size_t i = 0; i < embds.size; i++) {
         msgpack_object_str text = input.via.array.ptr[i].via.str;
 
         int n_tokens = llama_tokenize(worker.vocab, text.ptr, text.size,
-                                      worker.tokens, worker.n_ctx,
+                                      worker.tokens[i], worker.n_ctx,
                                       worker.add_bos, 0);
         if (n_tokens <= 0) {
             LOG_ERR("Couldn't tokenize (req %" PRIu64 ", seq %zu)", id, i);
-            continue;
-        }
-        if (pos + n_tokens > worker.n_batch) {
-            LOG_ERR("Couldn't fit input in batch (req %" PRIu64 ", seq %zu)", id, i);
             worker_error(id,
-                    "Batch size limit exceeded (max %d tokens). "
-                    "Input sequence %zu requires %d tokens, but only %d space remaining in batch.",
-                    worker.n_batch, i, n_tokens, worker.n_batch - pos);
+                    "Token size limit exceeded (max %d tokens). "
+                    "Input sequence %zu requires %d tokens.",
+                    worker.n_ctx, i, -n_tokens);
             return;
         }
-        for (int j = 0; j < n_tokens; j++) {
-            worker.batch.token[pos] = worker.tokens[j];
-            worker.batch.pos[pos] = j;
-            worker.batch.n_seq_id[pos] = 1;
-            worker.batch.seq_id[pos][0] = i;
-            worker.batch.logits[pos] = 0;
-            pos++;
-        }
-        if (n_tokens > 0)
-            worker.batch.logits[pos - 1] = 1;
-
-        seqs[i] = 1;
+        seqs[i].n_tokens = n_tokens;
+        embds.total_tokens += n_tokens;
     }
-    worker.batch.n_tokens = pos;
-    embds.n_tokens = pos;
+    llama_kv_self_seq_rm(worker.ctx, -1, -1, -1);
 
-    if (pos) {
-        int rc = worker.use_encode ? llama_encode(worker.ctx, worker.batch)
-                                   : llama_decode(worker.ctx, worker.batch);
-        if (rc) {
-            LOG_ERR("Failed llama_%s() (req %" PRIu64 ", rc %d)",
-                    worker.use_encode ? "encode" : "decode", id, rc);
-        } else {
-            for (size_t i = 0; i < embds.size; i++) {
-                if (seqs[i])
-                    embds.list[i] = llama_get_embeddings_seq(worker.ctx, i);
+    while (1) {
+        worker.batch.n_tokens = 0;
+        int pos = 0;
+
+        for (size_t i = 0; i < embds.size; i++) {
+            if (seqs[i].processed >= seqs[i].n_tokens)
+                continue;
+
+            int capacity = worker.n_batch - pos;
+            int limit = seqs[i].n_tokens;
+
+            if (limit - seqs[i].processed > capacity)
+                limit = seqs[i].processed + capacity;
+
+            for (int j = seqs[i].processed; j < limit; j++) {
+                worker.batch.token[pos] = worker.tokens[i][j];
+                worker.batch.pos[pos] = j;
+                worker.batch.n_seq_id[pos] = 1;
+                worker.batch.seq_id[pos][0] = i;
+                worker.batch.logits[pos] = 0;
+                pos++;
+            }
+            seqs[i].processed = limit;
+
+            if (pos == worker.n_batch)
+                break;
+        }
+        int fake = (int)embds.size - pos;
+
+        if (fake > 0) {
+            for (int j = 0; j <= fake; j++) {
+                worker.batch.token[pos] = 0;
+                worker.batch.pos[pos] = j;
+                worker.batch.n_seq_id[pos] = 1;
+                worker.batch.seq_id[pos][0] = embds.size;
+                worker.batch.logits[pos] = 0;
+                pos++;
             }
         }
+        worker.batch.n_tokens = pos;
+
+        if (pos > 0) {
+            int rc = worker.use_encode ? llama_encode(worker.ctx, worker.batch)
+                                       : llama_decode(worker.ctx, worker.batch);
+            if (rc != 0) {
+                LOG_ERR("Failed llama_%s() (req %" PRIu64 ", rc %d)",
+                        worker.use_encode ? "encode" : "decode", id, rc);
+                // worker_error ?
+                return;
+            }
+        }
+        if (fake)
+            llama_kv_self_seq_rm(worker.ctx, embds.size, -1, -1);
+
+        size_t done = 0;
+
+        for (size_t i = 0; i < embds.size; i++) {
+            if (seqs[i].processed == seqs[i].n_tokens) {
+                float *embd = llama_get_embeddings_seq(worker.ctx, i);
+
+                if (embd) {
+                    memcpy(worker.embds[i], embd, worker.n_embd * sizeof(float));
+                    embds.ok[i] = 1;
+                } else {
+                    LOG_ERR("Failed llama_get_embeddings_seq() (req %" PRIu64 ")", id);
+                }
+                llama_kv_self_seq_rm(worker.ctx, i, -1, -1);
+                seqs[i].processed++;
+            }
+            if (seqs[i].processed > seqs[i].n_tokens)
+                done++;
+        }
+        if (done == embds.size)
+            break;
     }
     reply(id, &embds);
 }
@@ -237,7 +281,7 @@ check_input(msgpack_object obj)
 
     size_t size = obj.via.array.size;
 
-    if (size == 0 || size > MAX_SIZE)
+    if (size == 0 || size > BATCH_SIZE)
         return nil;
 
     for (size_t i = 0; i < size; i++) {
@@ -415,7 +459,7 @@ setup_llama(void)
     llama_model_desc(worker.model, worker.name, sizeof(worker.name) - 1);
 
     struct llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx           = worker.n_ctx;
+    ctx_params.n_ctx           = worker.batch_size * worker.n_batch;
     ctx_params.n_batch         = worker.n_batch;
     ctx_params.n_ubatch        = worker.n_batch;
     ctx_params.n_threads       = worker.n_threads;
@@ -430,8 +474,8 @@ setup_llama(void)
     }
     worker.n_ctx = llama_n_ctx(worker.ctx);
 
-    if (worker.n_ctx <= 0) {
-        LOG_ERR("Invalid n_ctx: %d", worker.n_ctx);
+    if (worker.n_ctx <= 0 || worker.n_ctx != ctx_params.n_ctx) {
+        LOG_ERR("Invalid n_ctx: %d (params: %d)", worker.n_ctx, ctx_params.n_ctx);
         return 1;
     }
     worker.n_batch = llama_n_batch(worker.ctx);
@@ -464,17 +508,27 @@ setup_llama(void)
     }
     worker.use_encode = has_encoder;
 
-    worker.tokens = malloc(worker.n_ctx * sizeof(llama_token));
+    for (size_t i = 0; i < BATCH_SIZE; ++i) {
+        worker.tokens[i] = malloc(worker.n_ctx * sizeof(llama_token));
 
-    if (!worker.tokens) {
-        LOG_ERR("Couldn't alloc %d tokens", worker.n_ctx);
-        return 1;
+        if (!worker.tokens[i]) {
+            LOG_ERR("Couldn't alloc %d tokens", worker.n_ctx);
+            return 1;
+        }
     }
     worker.batch = llama_batch_init(worker.n_batch, 0, 1);
 
     if (!worker.batch.token) {
         LOG_ERR("Failed llama_batch_init()");
         return 1;
+    }
+    for (size_t i = 0; i < BATCH_SIZE; ++i) {
+        worker.embds[i] = malloc(worker.n_embd * sizeof(float));
+
+        if (!worker.embds[i]) {
+            LOG_ERR("Couldn't alloc %d floats", worker.n_embd);
+            return 1;
+        }
     }
     return 0;
 }
@@ -543,9 +597,13 @@ setup(int argc, char **argv)
         LOG_ERR("HFENDPOINT_GGUF is required");
         return 1;
     }
-    worker.n_ctx   = parse_int(getenv("HFENDPOINT_CTX"), 512);
-    worker.n_batch = parse_int(getenv("HFENDPOINT_BATCH"), 512);
+    worker.batch_size = parse_int(getenv("HFENDPOINT_BATCH_SIZE"), BATCH_SIZE);
+    worker.n_batch = parse_int(getenv("HFENDPOINT_N_BATCH"), 512);
 
+    if (worker.batch_size > BATCH_SIZE) {
+        LOG_ERR("HFENDPOINT_BATCH_SIZE exceeds the max allowed value of %u", BATCH_SIZE);
+        return 1;
+    }
     return setup_llama();
 }
 
@@ -555,9 +613,13 @@ cleanup(int exit_code)
     if (worker.batch.token)
         llama_batch_free(worker.batch);
 
-    if (worker.tokens)
-        free(worker.tokens);
+    for (size_t i = 0; i < BATCH_SIZE; ++i) {
+        if (worker.tokens[i])
+            free(worker.tokens[i]);
 
+        if (worker.embds[i])
+            free(worker.embds[i]);
+    }
     if (worker.ctx)
         llama_free(worker.ctx);
 
