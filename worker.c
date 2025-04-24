@@ -39,7 +39,7 @@ static struct {
     int use_encode;
     struct llama_batch batch;
     llama_token *tokens[BATCH_SIZE];
-    float *embds[BATCH_SIZE];
+    msgpack_sbuffer buffer;
 } worker = {
     .fd = -1,
 };
@@ -90,6 +90,7 @@ send_buffer(msgpack_sbuffer *buffer)
         written += ret;
         remaining -= ret;
     }
+    msgpack_sbuffer_clear(buffer);
 }
 
 static void
@@ -106,10 +107,9 @@ worker_error(uint64_t id, const char *fmt, ...)
         LOG_ERR("Failed vsnprintf()");
         return;
     }
-    msgpack_sbuffer buffer;
-    msgpack_sbuffer_init(&buffer);
     msgpack_packer packer;
-    msgpack_packer_init(&packer, &buffer, msgpack_sbuffer_write);
+    msgpack_sbuffer_clear(&worker.buffer);
+    msgpack_packer_init(&packer, &worker.buffer, msgpack_sbuffer_write);
 
     msgpack_pack_map(&packer, 2);
     pack_string(&packer, "id");
@@ -117,47 +117,7 @@ worker_error(uint64_t id, const char *fmt, ...)
     pack_string(&packer, "error");
     pack_string(&packer, error);
 
-    send_buffer(&buffer);
-    msgpack_sbuffer_destroy(&buffer);
-}
-
-static void
-reply(uint64_t id, struct embeddings *embds)
-{
-    msgpack_sbuffer buffer;
-    msgpack_sbuffer_init(&buffer);
-    msgpack_packer packer;
-    msgpack_packer_init(&packer, &buffer, msgpack_sbuffer_write);
-
-    msgpack_pack_map(&packer, 2);
-    pack_string(&packer, "id");
-    msgpack_pack_uint64(&packer, id);
-    pack_string(&packer, "data");
-
-    msgpack_pack_map(&packer, 3);
-    pack_string(&packer, "model");
-    pack_string(&packer, worker.name);
-    pack_string(&packer, "usage");
-    msgpack_pack_map(&packer, 2);
-    pack_string(&packer, "prompt_tokens");
-    msgpack_pack_uint32(&packer, embds->total_tokens);
-    pack_string(&packer, "total_tokens");
-    msgpack_pack_uint32(&packer, embds->total_tokens);
-    pack_string(&packer, "embeddings");
-    msgpack_pack_array(&packer, embds->size);
-
-    for (size_t i = 0; i < embds->size; i++) {
-        if (embds->ok[i]) {
-            msgpack_pack_array(&packer, worker.n_embd);
-            for (int j = 0; j < worker.n_embd; j++) {
-                msgpack_pack_float(&packer, worker.embds[i][j]);
-            }
-        } else {
-            msgpack_pack_nil(&packer);
-        }
-    }
-    send_buffer(&buffer);
-    msgpack_sbuffer_destroy(&buffer);
+    send_buffer(&worker.buffer);
 }
 
 static void
@@ -191,6 +151,26 @@ handle_request(uint64_t id, msgpack_object input)
         seqs[i].n_tokens = n_tokens;
         embds.total_tokens += n_tokens;
     }
+    msgpack_packer packer;
+    msgpack_sbuffer_clear(&worker.buffer);
+    msgpack_packer_init(&packer, &worker.buffer, msgpack_sbuffer_write);
+
+    msgpack_pack_map(&packer, 2);
+    pack_string(&packer, "id");
+    msgpack_pack_uint64(&packer, id);
+    pack_string(&packer, "data");
+    msgpack_pack_map(&packer, 3);
+    pack_string(&packer, "model");
+    pack_string(&packer, worker.name);
+    pack_string(&packer, "usage");
+    msgpack_pack_map(&packer, 2);
+    pack_string(&packer, "prompt_tokens");
+    msgpack_pack_uint32(&packer, embds.total_tokens);
+    pack_string(&packer, "total_tokens");
+    msgpack_pack_uint32(&packer, embds.total_tokens);
+    pack_string(&packer, "embeddings");
+    msgpack_pack_array(&packer, embds.size);
+
     llama_kv_self_seq_rm(worker.ctx, -1, -1, -1);
 
     while (1) {
@@ -254,10 +234,13 @@ handle_request(uint64_t id, msgpack_object input)
                 float *embd = llama_get_embeddings_seq(worker.ctx, i);
 
                 if (embd) {
-                    memcpy(worker.embds[i], embd, worker.n_embd * sizeof(float));
-                    embds.ok[i] = 1;
+                    msgpack_pack_array(&packer, worker.n_embd);
+                    for (int j = 0; j < worker.n_embd; j++) {
+                        msgpack_pack_float(&packer, embd[j]);
+                    }
                 } else {
                     LOG_ERR("Failed llama_get_embeddings_seq() (req %" PRIu64 ")", id);
+                    msgpack_pack_nil(&packer);
                 }
                 llama_kv_self_seq_rm(worker.ctx, i, -1, -1);
                 seqs[i].processed++;
@@ -268,7 +251,7 @@ handle_request(uint64_t id, msgpack_object input)
         if (done == embds.size)
             break;
     }
-    reply(id, &embds);
+    send_buffer(&worker.buffer);
 }
 
 static msgpack_object
@@ -522,14 +505,6 @@ setup_llama(void)
         LOG_ERR("Failed llama_batch_init()");
         return 1;
     }
-    for (size_t i = 0; i < BATCH_SIZE; ++i) {
-        worker.embds[i] = malloc(worker.n_embd * sizeof(float));
-
-        if (!worker.embds[i]) {
-            LOG_ERR("Couldn't alloc %d floats", worker.n_embd);
-            return 1;
-        }
-    }
     return 0;
 }
 
@@ -616,9 +591,6 @@ cleanup(int exit_code)
     for (size_t i = 0; i < BATCH_SIZE; ++i) {
         if (worker.tokens[i])
             free(worker.tokens[i]);
-
-        if (worker.embds[i])
-            free(worker.embds[i]);
     }
     if (worker.ctx)
         llama_free(worker.ctx);
@@ -638,8 +610,12 @@ main(int argc, char **argv)
 
     msgpack_unpacker unpacker;
 
-    if (!msgpack_unpacker_init(&unpacker, BUFFER_SIZE)) {
-        LOG_ERR("Failed msgpack_unpacker_init()");
+    worker.buffer.alloc = 1024 * 1024;
+    worker.buffer.data = malloc(worker.buffer.alloc);
+
+    if (!worker.buffer.data ||
+        !msgpack_unpacker_init(&unpacker, BUFFER_SIZE)) {
+        LOG_ERR("Failed malloc()");
         return cleanup(EXIT_FAILURE);
     }
     struct pollfd pfd = {
@@ -675,6 +651,7 @@ main(int argc, char **argv)
             }
         }
     }
+    msgpack_sbuffer_destroy(&worker.buffer);
     msgpack_unpacker_destroy(&unpacker);
     return cleanup(exit_code);
 }
