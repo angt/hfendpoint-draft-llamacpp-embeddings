@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <math.h>
 #include <poll.h>
 #include <sched.h>
 #include <stdarg.h>
@@ -120,6 +121,17 @@ worker_error(uint64_t id, const char *fmt, ...)
     send_buffer(&worker.buffer);
 }
 
+static inline float
+l2_norm(const float *embd, int n)
+{
+    float sum_sq = 0.0f;
+
+    for (int i = 0; i < n; ++i) {
+        sum_sq += embd[i] * embd[i];
+    }
+    return sqrtf(sum_sq);
+}
+
 static void
 handle_request(uint64_t id, msgpack_object input)
 {
@@ -131,7 +143,8 @@ handle_request(uint64_t id, msgpack_object input)
     };
     struct {
         int n_tokens;
-        int processed;
+        unsigned char id;
+        unsigned char ok;
     } seqs[BATCH_SIZE] = {0};
 
     for (size_t i = 0; i < embds.size; i++) {
@@ -173,83 +186,87 @@ handle_request(uint64_t id, msgpack_object input)
 
     llama_kv_self_seq_rm(worker.ctx, -1, -1, -1);
 
-    while (1) {
-        worker.batch.n_tokens = 0;
-        int pos = 0;
+    int seq_id = 0;
+    int processed = 0;
 
-        for (size_t i = 0; i < embds.size; i++) {
-            if (seqs[i].processed >= seqs[i].n_tokens)
+    for (int i = 0; i < embds.size;) {
+        worker.batch.n_tokens = 0;
+
+        int max_seq_id = 0;
+        int skip_seq_id = processed ? seq_id : -1;
+        int fake_seq_id = -1;
+
+        if (!processed)
+            seq_id = 0;
+
+        for (int pos = 0; pos < worker.n_batch; pos++) {
+            worker.batch.token[pos] = worker.tokens[i][processed];
+            worker.batch.pos[pos] = processed;
+            worker.batch.n_seq_id[pos] = 1;
+            worker.batch.seq_id[pos][0] = seq_id;
+            worker.batch.logits[pos] = 0;
+            worker.batch.n_tokens++;
+
+            if (max_seq_id < seq_id)
+                max_seq_id = seq_id;
+
+            if (seqs[i].n_tokens == ++processed) {
+                processed = 0;
+                seqs[i].id = seq_id;
+                seqs[i].ok = 1;
+
+                if (seq_id == skip_seq_id) {
+                    seq_id = !skip_seq_id;
+                } else if (skip_seq_id == ++seq_id) {
+                    seq_id++;
+                }
+                if (embds.size == ++i) {
+                    if (max_seq_id < worker.batch.n_tokens)
+                        break;
+
+                    for (pos++; pos <= max_seq_id; pos++) {
+                        worker.batch.token[pos] = 0;
+                        worker.batch.pos[pos] = processed++;
+                        worker.batch.n_seq_id[pos] = 1;
+                        worker.batch.seq_id[pos][0] = seq_id;
+                        worker.batch.logits[pos] = 0;
+                        worker.batch.n_tokens++;
+                    }
+                    fake_seq_id = seq_id;
+                    break;
+                }
+            }
+        }
+        int rc = worker.use_encode ? llama_encode(worker.ctx, worker.batch)
+                                   : llama_decode(worker.ctx, worker.batch);
+        if (rc != 0) {
+            LOG_ERR("Failed llama_%s() (req %" PRIu64 ", rc %d)",
+                    worker.use_encode ? "encode" : "decode", id, rc);
+            // worker_error ?
+            return;
+        }
+        if (fake_seq_id >= 0)
+            llama_kv_self_seq_rm(worker.ctx, fake_seq_id, -1, -1);
+
+        for (size_t k = 0; k < i; k++) {
+            if (!seqs[k].ok)
                 continue;
 
-            int capacity = worker.n_batch - pos;
-            int limit = seqs[i].n_tokens;
+            float *embd = llama_get_embeddings_seq(worker.ctx, seqs[k].id);
+            float inorm = 1.0 / l2_norm(embd, worker.n_embd);
 
-            if (limit - seqs[i].processed > capacity)
-                limit = seqs[i].processed + capacity;
-
-            for (int j = seqs[i].processed; j < limit; j++) {
-                worker.batch.token[pos] = worker.tokens[i][j];
-                worker.batch.pos[pos] = j;
-                worker.batch.n_seq_id[pos] = 1;
-                worker.batch.seq_id[pos][0] = i;
-                worker.batch.logits[pos] = 0;
-                pos++;
-            }
-            seqs[i].processed = limit;
-
-            if (pos == worker.n_batch)
-                break;
-        }
-        int fake = (int)embds.size - pos;
-
-        if (fake > 0) {
-            for (int j = 0; j <= fake; j++) {
-                worker.batch.token[pos] = 0;
-                worker.batch.pos[pos] = j;
-                worker.batch.n_seq_id[pos] = 1;
-                worker.batch.seq_id[pos][0] = embds.size;
-                worker.batch.logits[pos] = 0;
-                pos++;
-            }
-        }
-        worker.batch.n_tokens = pos;
-
-        if (pos > 0) {
-            int rc = worker.use_encode ? llama_encode(worker.ctx, worker.batch)
-                                       : llama_decode(worker.ctx, worker.batch);
-            if (rc != 0) {
-                LOG_ERR("Failed llama_%s() (req %" PRIu64 ", rc %d)",
-                        worker.use_encode ? "encode" : "decode", id, rc);
-                // worker_error ?
-                return;
-            }
-        }
-        if (fake)
-            llama_kv_self_seq_rm(worker.ctx, embds.size, -1, -1);
-
-        size_t done = 0;
-
-        for (size_t i = 0; i < embds.size; i++) {
-            if (seqs[i].processed == seqs[i].n_tokens) {
-                float *embd = llama_get_embeddings_seq(worker.ctx, i);
-
-                if (embd) {
-                    msgpack_pack_array(&packer, worker.n_embd);
-                    for (int j = 0; j < worker.n_embd; j++) {
-                        msgpack_pack_float(&packer, embd[j]);
-                    }
-                } else {
-                    LOG_ERR("Failed llama_get_embeddings_seq() (req %" PRIu64 ")", id);
-                    msgpack_pack_nil(&packer);
+            if (embd) {
+                msgpack_pack_array(&packer, worker.n_embd);
+                for (int j = 0; j < worker.n_embd; j++) {
+                    msgpack_pack_float(&packer, inorm * embd[j]);
                 }
-                llama_kv_self_seq_rm(worker.ctx, i, -1, -1);
-                seqs[i].processed++;
+            } else {
+                LOG_ERR("Failed llama_get_embeddings_seq() (req %" PRIu64 ")", id);
+                msgpack_pack_nil(&packer);
             }
-            if (seqs[i].processed > seqs[i].n_tokens)
-                done++;
+            llama_kv_self_seq_rm(worker.ctx, seqs[k].id, -1, -1);
+            seqs[k].ok = 0;
         }
-        if (done == embds.size)
-            break;
     }
     send_buffer(&worker.buffer);
 }
