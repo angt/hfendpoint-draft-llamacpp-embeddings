@@ -1,4 +1,5 @@
 CFLAGS = -O2 -Wall
+LDLIBS = -lm
 
 CFLAGS  += $(shell pkg-config --cflags llama)
 LDFLAGS += $(shell pkg-config --libs-only-L llama)
