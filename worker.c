@@ -17,8 +17,9 @@
 #include <llama.h>
 #include <msgpack.h>
 
-#define BUFFER_SIZE 4096U
-#define BATCH_SIZE   128U
+#define BATCH_SIZE    128U
+#define BUFFER_SIZE  (1024U * 1024U)
+#define BUFFER_COUNT  4U
 
 #define LOG(format, ...)     fprintf(stdout, format "\n", ##__VA_ARGS__)
 #define LOG_ERR(format, ...) fprintf(stderr, format "\n", ##__VA_ARGS__)
@@ -39,16 +40,18 @@ static struct {
     enum llama_pooling_type pool_type;
     int use_encode;
     struct llama_batch batch;
-    llama_token *tokens[BATCH_SIZE];
-    msgpack_sbuffer buffer;
+    llama_token *tokens;
+    struct {
+        struct {
+            msgpack_sbuffer s;
+            size_t written;
+        } buffer[BUFFER_COUNT];
+        int head;
+        int tail;
+        int count;
+    } send;
 } worker = {
     .fd = -1,
-};
-
-struct embeddings {
-    size_t size;
-    uint32_t total_tokens;
-    unsigned char ok[BATCH_SIZE];
 };
 
 static void
@@ -67,31 +70,30 @@ key_matches(msgpack_object key, const char *str)
            !memcmp(key.via.str.ptr, str, key.via.str.size);
 }
 
-static void
-send_buffer(msgpack_sbuffer *buffer)
+static msgpack_packer
+get_packer(void)
 {
-    ssize_t written = 0;
-    size_t remaining = buffer->size;
-
-    while (remaining) {
-        ssize_t ret = write(worker.fd, buffer->data + written, remaining);
-
-        if (ret == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                struct pollfd pfd = {
-                    .fd = worker.fd,
-                    .events = POLLOUT
-                };
-                poll(&pfd, 1, -1);
-                continue;
-            }
-            LOG_ERR("Failed write() (errno %d)", errno);
-            break;
-        }
-        written += ret;
-        remaining -= ret;
+    // should not happpen
+    if (worker.send.count >= BUFFER_COUNT) {
+        LOG_ERR("No send slot available (count: %d, max: %d)",
+                worker.send.count, BUFFER_COUNT);
+        return (msgpack_packer){0};
     }
+    worker.send.buffer[worker.send.tail].written = 0;
+
+    msgpack_sbuffer *buffer = &worker.send.buffer[worker.send.tail].s;
     msgpack_sbuffer_clear(buffer);
+
+    msgpack_packer packer;
+    msgpack_packer_init(&packer, buffer, msgpack_sbuffer_write);
+    return packer;
+}
+
+static void
+commit_buffer(void)
+{
+    worker.send.tail = (worker.send.tail + 1) % BUFFER_COUNT;
+    worker.send.count++;
 }
 
 static void
@@ -108,9 +110,10 @@ worker_error(uint64_t id, const char *fmt, ...)
         LOG_ERR("Failed vsnprintf()");
         return;
     }
-    msgpack_packer packer;
-    msgpack_sbuffer_clear(&worker.buffer);
-    msgpack_packer_init(&packer, &worker.buffer, msgpack_sbuffer_write);
+    msgpack_packer packer = get_packer();
+
+    if (!packer.data)
+        return;
 
     msgpack_pack_map(&packer, 2);
     pack_string(&packer, "id");
@@ -118,7 +121,7 @@ worker_error(uint64_t id, const char *fmt, ...)
     pack_string(&packer, "error");
     pack_string(&packer, error);
 
-    send_buffer(&worker.buffer);
+    commit_buffer();
 }
 
 static inline float
@@ -133,63 +136,95 @@ l2_norm(const float *embd, int n)
 }
 
 static void
+handle_tokenize(uint64_t id, msgpack_object input)
+{
+    if (input.type == MSGPACK_OBJECT_NIL)
+        return;
+
+    size_t size = input.via.array.size;
+    msgpack_packer packer = get_packer();
+
+    if (!packer.data)
+        return;
+
+    msgpack_pack_map(&packer, 2);
+    pack_string(&packer, "id");
+    msgpack_pack_uint64(&packer, id);
+    pack_string(&packer, "data");
+    msgpack_pack_map(&packer, 1);
+    pack_string(&packer, "tokens");
+    msgpack_pack_array(&packer, size);
+
+    for (size_t i = 0; i < size; i++) {
+        msgpack_object_str text = input.via.array.ptr[i].via.str;
+
+        int n_tokens = llama_tokenize(worker.vocab, text.ptr, text.size,
+                                      worker.tokens, worker.n_ctx,
+                                      worker.add_bos, 0);
+        if (n_tokens <= 0)
+            return worker_error(id,
+                    "Token size limit exceeded (max %d tokens). "
+                    "Input sequence %zu requires %d tokens.",
+                    worker.n_ctx, i, -n_tokens);
+
+        msgpack_pack_array(&packer, n_tokens);
+
+        for (int j = 0; j < n_tokens; j++)
+            msgpack_pack_uint32(&packer, worker.tokens[j]);
+    }
+    if (size == 0)
+        msgpack_pack_nil(&packer);
+
+    commit_buffer();
+}
+
+static void
 handle_request(uint64_t id, msgpack_object input)
 {
     if (input.type == MSGPACK_OBJECT_NIL)
         return;
 
-    struct embeddings embds = {
-        .size = input.via.array.size
-    };
+    size_t size = input.via.array.size;
     struct {
         int n_tokens;
         unsigned char id;
         unsigned char ok;
     } seqs[BATCH_SIZE] = {0};
 
-    for (size_t i = 0; i < embds.size; i++) {
-        msgpack_object_str text = input.via.array.ptr[i].via.str;
+    for (size_t i = 0; i < size; ++i) {
+        if (input.via.array.ptr[i].type != MSGPACK_OBJECT_ARRAY)
+            return worker_error(id,
+                    "Invalid input: sequence %zu is not an array of tokens.", i);
 
-        int n_tokens = llama_tokenize(worker.vocab, text.ptr, text.size,
-                                      worker.tokens[i], worker.n_ctx,
-                                      worker.add_bos, 0);
-        if (n_tokens <= 0) {
-            LOG_ERR("Couldn't tokenize (req %" PRIu64 ", seq %zu)", id, i);
-            worker_error(id,
-                    "Token size limit exceeded (max %d tokens). "
-                    "Input sequence %zu requires %d tokens.",
-                    worker.n_ctx, i, -n_tokens);
-            return;
-        }
-        seqs[i].n_tokens = n_tokens;
-        embds.total_tokens += n_tokens;
+        seqs[i].n_tokens = input.via.array.ptr[i].via.array.size;
+
+        if (seqs[i].n_tokens == 0)
+            return worker_error(id,
+                    "Invalid input: sequence %zu is empty.", i);
+
+        if (seqs[i].n_tokens > worker.n_ctx)
+            return worker_error(id,
+                    "Input sequence %zu exceeds maximum token limit %d.", i, worker.n_ctx);
     }
-    msgpack_packer packer;
-    msgpack_sbuffer_clear(&worker.buffer);
-    msgpack_packer_init(&packer, &worker.buffer, msgpack_sbuffer_write);
+    msgpack_packer packer = get_packer();
+
+    if (!packer.data)
+        return;
 
     msgpack_pack_map(&packer, 2);
     pack_string(&packer, "id");
     msgpack_pack_uint64(&packer, id);
     pack_string(&packer, "data");
-    msgpack_pack_map(&packer, 3);
-    pack_string(&packer, "model");
-    pack_string(&packer, worker.name);
-    pack_string(&packer, "usage");
-    msgpack_pack_map(&packer, 2);
-    pack_string(&packer, "prompt_tokens");
-    msgpack_pack_uint32(&packer, embds.total_tokens);
-    pack_string(&packer, "total_tokens");
-    msgpack_pack_uint32(&packer, embds.total_tokens);
+    msgpack_pack_map(&packer, 1);
     pack_string(&packer, "embeddings");
-    msgpack_pack_array(&packer, embds.size);
+    msgpack_pack_array(&packer, size);
 
     llama_kv_self_seq_rm(worker.ctx, -1, -1, -1);
 
     int seq_id = 0;
     int processed = 0;
 
-    for (int i = 0; i < embds.size;) {
+    for (int i = 0; i < size;) {
         worker.batch.n_tokens = 0;
 
         int max_seq_id = 0;
@@ -200,7 +235,8 @@ handle_request(uint64_t id, msgpack_object input)
             seq_id = 0;
 
         for (int pos = 0; pos < worker.n_batch; pos++) {
-            worker.batch.token[pos] = worker.tokens[i][processed];
+            llama_token token = input.via.array.ptr[i].via.array.ptr[processed].via.u64;
+            worker.batch.token[pos] = token;
             worker.batch.pos[pos] = processed;
             worker.batch.n_seq_id[pos] = 1;
             worker.batch.seq_id[pos][0] = seq_id;
@@ -220,7 +256,7 @@ handle_request(uint64_t id, msgpack_object input)
                 } else if (skip_seq_id == ++seq_id) {
                     seq_id++;
                 }
-                if (embds.size == ++i) {
+                if (size == ++i) {
                     if (max_seq_id < worker.batch.n_tokens)
                         break;
 
@@ -239,12 +275,9 @@ handle_request(uint64_t id, msgpack_object input)
         }
         int rc = worker.use_encode ? llama_encode(worker.ctx, worker.batch)
                                    : llama_decode(worker.ctx, worker.batch);
-        if (rc != 0) {
-            LOG_ERR("Failed llama_%s() (req %" PRIu64 ", rc %d)",
-                    worker.use_encode ? "encode" : "decode", id, rc);
-            // worker_error ?
-            return;
-        }
+        if (rc != 0)
+            return worker_error(id, "Batch failed, rc=%d.", rc);
+
         if (fake_seq_id >= 0)
             llama_kv_self_seq_rm(worker.ctx, fake_seq_id, -1, -1);
 
@@ -268,27 +301,7 @@ handle_request(uint64_t id, msgpack_object input)
             seqs[k].ok = 0;
         }
     }
-    send_buffer(&worker.buffer);
-}
-
-static msgpack_object
-check_input(msgpack_object obj)
-{
-    msgpack_object nil = { .type = MSGPACK_OBJECT_NIL };
-
-    if (obj.type != MSGPACK_OBJECT_ARRAY)
-        return nil;
-
-    size_t size = obj.via.array.size;
-
-    if (size == 0 || size > BATCH_SIZE)
-        return nil;
-
-    for (size_t i = 0; i < size; i++) {
-        if (obj.via.array.ptr[i].type != MSGPACK_OBJECT_STR)
-            return nil;
-    }
-    return obj;
+    commit_buffer();
 }
 
 static msgpack_object
@@ -299,14 +312,18 @@ extract_input(msgpack_object obj)
     if (obj.type != MSGPACK_OBJECT_MAP)
         return nil;
 
-    msgpack_object_kv *ptr = obj.via.map.ptr;
-    msgpack_object_kv *end = ptr + obj.via.map.size;
+    if (obj.via.map.size != 1)
+        return nil;
 
-    for (; ptr < end; ptr++) {
-        if (key_matches(ptr->key, "input"))
-            return check_input(ptr->val);
-    }
-    return nil;
+    msgpack_object_kv *kv = obj.via.map.ptr;
+
+    if (!key_matches(kv->key, "input"))
+        return nil;
+
+    if (kv->val.type != MSGPACK_OBJECT_ARRAY)
+        return nil;
+
+    return kv->val;
 }
 
 static void
@@ -317,11 +334,11 @@ dispatch_request(msgpack_object obj)
         return;
     }
     uint64_t id = 0;
-    msgpack_object data = { .type = MSGPACK_OBJECT_NIL };
-
     int found_id = 0;
-    int found_name = 0;
-    int found_data = 0;
+    int found = 0;
+
+    msgpack_object name = { .type = MSGPACK_OBJECT_NIL };
+    msgpack_object data = { .type = MSGPACK_OBJECT_NIL };
 
     msgpack_object_kv *ptr = obj.via.map.ptr;
     msgpack_object_kv *end = ptr + obj.via.map.size;
@@ -333,24 +350,28 @@ dispatch_request(msgpack_object obj)
                 found_id = 1;
             }
         } else if (key_matches(ptr->key, "name")) {
-            found_name = 1;
-            if (!key_matches(ptr->val, "embeddings")) {
-                LOG("Skipping non embeddings request");
-                return;
-            }
+            name = ptr->val;
         } else if (key_matches(ptr->key, "data")) {
             data = ptr->val;
-            found_data = 1;
         }
-        if (found_id && found_name && found_data)
+        if (found_id &&
+            name.type == MSGPACK_OBJECT_STR &&
+            data.type == MSGPACK_OBJECT_MAP) {
+            found = 1;
             break;
+        }
     }
-    if (!found_id || !found_name || !found_data) {
+    if (!found) {
         LOG_ERR("Skipping malformed request");
         return;
     }
-    msgpack_object input = extract_input(data);
-    handle_request(id, input);
+    if (key_matches(name, "tokenize"))
+        return handle_tokenize(id, extract_input(data));
+
+    if (key_matches(name, "embeddings"))
+        return handle_request(id, extract_input(data));
+
+    LOG("Skipping non embeddings request");
 }
 
 static ssize_t
@@ -410,6 +431,52 @@ process_data(msgpack_unpacker *unpacker, int fd)
         }
     }
     return 0;
+}
+
+static void
+update_buffer(size_t written)
+{
+    msgpack_sbuffer *buffer = &worker.send.buffer[worker.send.head].s;
+
+    if (written >= buffer->size)
+        written = 0;
+
+    if (written == 0) {
+        msgpack_sbuffer_clear(buffer);
+        worker.send.buffer[worker.send.head].written = 0;
+        worker.send.head = (worker.send.head + 1) % BUFFER_COUNT;
+        worker.send.count--;
+    } else {
+        worker.send.buffer[worker.send.head].written = written;
+    }
+}
+
+static void
+send_buffer(void)
+{
+    if (!worker.send.count)
+        return;
+
+    msgpack_sbuffer *buffer = &worker.send.buffer[worker.send.head].s;
+    size_t written = worker.send.buffer[worker.send.head].written;
+
+    if (written >= buffer->size)
+        return update_buffer(0);
+
+    size_t size = buffer->size - written;
+    const char *data = buffer->data + written;
+    ssize_t ret = write(worker.fd, data, size);
+
+    if (ret == -1) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return;
+        LOG_ERR("Failed write() (errno %d)", errno);
+        return update_buffer(0);
+    }
+    if (ret == 0)
+        return update_buffer(0);
+
+    return update_buffer(written + ret);
 }
 
 static int
@@ -507,14 +574,11 @@ setup_llama(void)
         return 1;
     }
     worker.use_encode = has_encoder;
+    worker.tokens = malloc(worker.n_ctx * sizeof(llama_token));
 
-    for (size_t i = 0; i < BATCH_SIZE; ++i) {
-        worker.tokens[i] = malloc(worker.n_ctx * sizeof(llama_token));
-
-        if (!worker.tokens[i]) {
-            LOG_ERR("Couldn't alloc %d tokens", worker.n_ctx);
-            return 1;
-        }
+    if (!worker.tokens) {
+        LOG_ERR("Couldn't alloc %d tokens", worker.n_ctx);
+        return 1;
     }
     worker.batch = llama_batch_init(worker.n_batch, 0, 1);
 
@@ -596,19 +660,30 @@ setup(int argc, char **argv)
         LOG_ERR("HFENDPOINT_BATCH_SIZE exceeds the max allowed value of %u", BATCH_SIZE);
         return 1;
     }
+    for (size_t i = 0; i < BUFFER_COUNT; i++) {
+        worker.send.buffer[i].s.alloc = BUFFER_SIZE;
+        worker.send.buffer[i].s.data = malloc(BUFFER_SIZE);
+
+        if (!worker.send.buffer[i].s.data) {
+            LOG_ERR("Failed malloc()");
+            return 1;
+        }
+    }
     return setup_llama();
 }
 
 static int
 cleanup(int exit_code)
 {
+    for (size_t i = 0; i < BUFFER_COUNT; i++)
+        msgpack_sbuffer_destroy(&worker.send.buffer[i].s);
+
     if (worker.batch.token)
         llama_batch_free(worker.batch);
 
-    for (size_t i = 0; i < BATCH_SIZE; ++i) {
-        if (worker.tokens[i])
-            free(worker.tokens[i]);
-    }
+    if (worker.tokens)
+        free(worker.tokens);
+
     if (worker.ctx)
         llama_free(worker.ctx);
 
@@ -627,21 +702,22 @@ main(int argc, char **argv)
 
     msgpack_unpacker unpacker;
 
-    worker.buffer.alloc = 1024 * 1024;
-    worker.buffer.data = malloc(worker.buffer.alloc);
-
-    if (!worker.buffer.data ||
-        !msgpack_unpacker_init(&unpacker, BUFFER_SIZE)) {
+    if (!msgpack_unpacker_init(&unpacker, BUFFER_SIZE)) {
         LOG_ERR("Failed malloc()");
         return cleanup(EXIT_FAILURE);
     }
-    struct pollfd pfd = {
-        .fd = worker.fd,
-        .events = POLLIN
-    };
     int exit_code = EXIT_FAILURE;
 
     while (1) {
+        struct pollfd pfd = {
+            .fd = worker.fd,
+        };
+        if (worker.send.count <= (BUFFER_COUNT - 2))
+            pfd.events |= POLLIN;
+
+        if (worker.send.count > 0)
+            pfd.events |= POLLOUT;
+
         int ret = poll(&pfd, 1, -1);
 
         if (ret == -1) {
@@ -667,8 +743,9 @@ main(int argc, char **argv)
                 break;
             }
         }
+        if (pfd.revents & POLLOUT)
+            send_buffer();
     }
-    msgpack_sbuffer_destroy(&worker.buffer);
     msgpack_unpacker_destroy(&unpacker);
     return cleanup(exit_code);
 }

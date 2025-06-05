@@ -10,7 +10,7 @@ ARG llamacpp_backend_dl=OFF
 ARG llamacpp_cpu_all_variants=OFF
 ARG llamacpp_openmp=OFF
 ARG msgpack_version=6.1.0
-ARG hfendpoint_version=0.1.0
+ARG hfendpoint_version=0.2.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     clang \
