@@ -558,7 +558,7 @@ log_callback(enum ggml_log_level level, const char *text, void *user_data) {
     (void) user_data;
     if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
         fprintf(stderr, "%s", text);
-    } else {
+    } else if (level != GGML_LOG_LEVEL_DEBUG) {
         fprintf(stdout, "%s", text);
     }
 }
