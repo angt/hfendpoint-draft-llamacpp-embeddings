@@ -393,7 +393,7 @@ read_data(int fd, void *buffer, size_t size)
 }
 
 static int
-process_data(msgpack_unpacker *unpacker, int fd)
+process_data(msgpack_unpacker *unpacker, msgpack_unpacked *unpacked, int fd)
 {
     if (!msgpack_unpacker_reserve_buffer(unpacker, BUFFER_SIZE)) {
         LOG_ERR("Failed msgpack_unpacker_reserve_buffer()");
@@ -405,32 +405,27 @@ process_data(msgpack_unpacker *unpacker, int fd)
         return (int)bytes;
 
     msgpack_unpacker_buffer_consumed(unpacker, bytes);
-    msgpack_unpacked result;
+    int ret;
 
     for (;;) {
-        msgpack_unpacked_init(&result);
+        ret = msgpack_unpacker_next(unpacker, unpacked);
 
-        int ret = msgpack_unpacker_next(unpacker, &result);
-
-        if (ret == MSGPACK_UNPACK_SUCCESS)
-            dispatch_request(result.data);
-
-        msgpack_unpacked_destroy(&result);
-
-        if (ret == MSGPACK_UNPACK_CONTINUE)
+        if (ret != MSGPACK_UNPACK_SUCCESS)
             break;
 
-        if (ret == MSGPACK_UNPACK_PARSE_ERROR) {
-            LOG_ERR("Msgpack parse error. Resetting unpacker.");
-            msgpack_unpacker_reset(unpacker);
-            break;
-        }
-        if (ret != MSGPACK_UNPACK_SUCCESS) {
-            LOG_ERR("Unexpected unpacker state: %d", ret);
-            return -1;
-        }
+        dispatch_request(unpacked->data);
     }
-    return 0;
+    if (ret == MSGPACK_UNPACK_CONTINUE)
+        return 0;
+
+    if (ret == MSGPACK_UNPACK_PARSE_ERROR) {
+        LOG_ERR("Msgpack parse error. Resetting unpacker.");
+        msgpack_unpacker_reset(unpacker);
+        msgpack_unpacked_destroy(unpacked);
+        return 0;
+    }
+    LOG_ERR("Unexpected unpacker state: %d", ret);
+    return -1;
 }
 
 static void
@@ -700,10 +695,11 @@ main(int argc, char **argv)
     if (setup(argc, argv))
         return cleanup(EXIT_FAILURE);
 
-    msgpack_unpacker unpacker;
+    msgpack_unpacker unpacker = {0};
+    msgpack_unpacked unpacked = {0};
 
     if (!msgpack_unpacker_init(&unpacker, BUFFER_SIZE)) {
-        LOG_ERR("Failed malloc()");
+        LOG_ERR("Failed msgpack_unpacker_init()");
         return cleanup(EXIT_FAILURE);
     }
     int exit_code = EXIT_FAILURE;
@@ -732,13 +728,13 @@ main(int argc, char **argv)
             break;
         }
         if (pfd.revents & (POLLIN | POLLHUP)) {
-            int ret = process_data(&unpacker, pfd.fd);
+            int ret = process_data(&unpacker, &unpacked, pfd.fd);
 
             if (ret == -1)
                 break;
 
             if (ret == -2) {
-                process_data(&unpacker, pfd.fd);
+                process_data(&unpacker, &unpacked, pfd.fd);
                 exit_code = EXIT_SUCCESS;
                 break;
             }
@@ -747,5 +743,7 @@ main(int argc, char **argv)
             send_buffer();
     }
     msgpack_unpacker_destroy(&unpacker);
+    msgpack_unpacked_destroy(&unpacked);
+
     return cleanup(exit_code);
 }
