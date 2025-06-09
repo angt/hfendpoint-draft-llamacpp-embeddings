@@ -179,7 +179,7 @@ handle_tokenize(uint64_t id, msgpack_object input)
 }
 
 static void
-handle_request(uint64_t id, msgpack_object input)
+handle_embeddings(uint64_t id, msgpack_object input)
 {
     if (input.type == MSGPACK_OBJECT_NIL)
         return;
@@ -369,7 +369,7 @@ dispatch_request(msgpack_object obj)
         return handle_tokenize(id, extract_input(data));
 
     if (key_matches(name, "embeddings"))
-        return handle_request(id, extract_input(data));
+        return handle_embeddings(id, extract_input(data));
 
     LOG("Skipping non embeddings request");
 }
