@@ -16,7 +16,6 @@
 #include <llama.h>
 #include <msgpack.h>
 
-#define BATCH_SIZE    128U
 #define BUFFER_SIZE  (1024U * 1024U)
 
 #define LOG(format, ...)     fprintf(stdout, format "\n", ##__VA_ARGS__)
@@ -28,7 +27,6 @@ static struct {
     int fd;
     struct llama_model *model;
     struct llama_context *ctx;
-    int batch_size;
     int n_ctx;
     int n_batch;
     int n_threads;
@@ -162,22 +160,16 @@ handle_embeddings(uint64_t id, msgpack_object input)
 
     size_t size = input.via.array.size;
 
-    struct {
-        int n_tokens;
-        unsigned char id;
-        unsigned char ok;
-    } seqs[BATCH_SIZE] = {0};
-
     for (size_t i = 0; i < size; ++i) {
         if (input.via.array.ptr[i].type != MSGPACK_OBJECT_ARRAY)
             return worker_error(id, "input[%zu] is not an array", i);
 
-        seqs[i].n_tokens = input.via.array.ptr[i].via.array.size;
+        size_t n_tokens = input.via.array.ptr[i].via.array.size;
 
-        if (seqs[i].n_tokens == 0)
+        if (n_tokens == 0)
             return worker_error(id, "input[%zu] is empty", i);
 
-        if (seqs[i].n_tokens > worker.n_ctx)
+        if (n_tokens > worker.n_ctx)
             return worker_error(id, "input[%zu] exceeds %d", i, worker.n_ctx);
     }
     msgpack_packer *packer = &worker.send.packer;
@@ -206,8 +198,9 @@ handle_embeddings(uint64_t id, msgpack_object input)
             seq_id = 0;
 
         for (int pos = 0; pos < worker.n_batch; pos++) {
-            llama_token token = input.via.array.ptr[i].via.array.ptr[processed].via.u64;
-            worker.batch.token[pos] = token;
+            msgpack_object_array seq = input.via.array.ptr[i].via.array;
+
+            worker.batch.token[pos] = seq.ptr[processed].via.u64;
             worker.batch.pos[pos] = processed;
             worker.batch.n_seq_id[pos] = 1;
             worker.batch.seq_id[pos][0] = seq_id;
@@ -217,10 +210,8 @@ handle_embeddings(uint64_t id, msgpack_object input)
             if (max_seq_id < seq_id)
                 max_seq_id = seq_id;
 
-            if (seqs[i].n_tokens == ++processed) {
+            if (seq.size == ++processed) {
                 processed = 0;
-                seqs[i].id = seq_id;
-                seqs[i].ok = 1;
 
                 if (seq_id == skip_seq_id) {
                     seq_id = !skip_seq_id;
@@ -252,11 +243,16 @@ handle_embeddings(uint64_t id, msgpack_object input)
         if (fake_seq_id >= 0)
             llama_kv_self_seq_rm(worker.ctx, fake_seq_id, -1, -1);
 
-        for (size_t k = 0; k < i; k++) {
-            if (!seqs[k].ok)
-                continue;
+        for (int pos = 0; pos < worker.batch.n_tokens; pos++) {
+            int pos_seq_id = worker.batch.seq_id[pos][0];
 
-            float *embd = llama_get_embeddings_seq(worker.ctx, seqs[k].id);
+            if (pos == worker.batch.n_tokens - 1) {
+                if (processed || pos_seq_id == fake_seq_id)
+                    break;
+            } else if (pos_seq_id == worker.batch.seq_id[pos + 1][0]) {
+                continue;
+            }
+            float *embd = llama_get_embeddings_seq(worker.ctx, pos_seq_id);
             float inorm = 1.0 / l2_norm(embd, worker.n_embd);
 
             if (embd) {
@@ -268,8 +264,7 @@ handle_embeddings(uint64_t id, msgpack_object input)
                 LOG_ERR("Failed llama_get_embeddings_seq() (req %" PRIu64 ")", id);
                 msgpack_pack_nil(packer);
             }
-            llama_kv_self_seq_rm(worker.ctx, seqs[k].id, -1, -1);
-            seqs[k].ok = 0;
+            llama_kv_self_seq_rm(worker.ctx, pos_seq_id, -1, -1);
         }
     }
     commit_buffer();
@@ -446,7 +441,7 @@ setup_llama(void)
     llama_model_desc(worker.model, worker.name, sizeof(worker.name) - 1);
 
     struct llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx           = worker.batch_size * worker.n_batch;
+    ctx_params.n_ctx           = worker.n_ctx;
     ctx_params.n_batch         = worker.n_batch;
     ctx_params.n_ubatch        = worker.n_batch;
     ctx_params.n_threads       = worker.n_threads;
@@ -569,13 +564,8 @@ setup(int argc, char **argv)
         LOG_ERR("HFENDPOINT_GGUF is required");
         return 1;
     }
-    worker.batch_size = parse_int(getenv("HFENDPOINT_BATCH_SIZE"), BATCH_SIZE);
     worker.n_batch = parse_int(getenv("HFENDPOINT_N_BATCH"), 512);
-
-    if (worker.batch_size > BATCH_SIZE) {
-        LOG_ERR("HFENDPOINT_BATCH_SIZE exceeds the max allowed value of %u", BATCH_SIZE);
-        return 1;
-    }
+    worker.n_ctx = parse_int(getenv("HFENDPOINT_N_CTX"), 128 * worker.n_batch);
     const char *pooling = getenv("HFENDPOINT_POOLING");
 
     if (pooling) {
