@@ -98,7 +98,7 @@ worker_error(uint64_t id, const char *fmt, ...)
     commit_buffer();
 }
 
-static inline float
+static float
 l2_norm(const float *embd, int n)
 {
     float sum_sq = 0.0f;
@@ -157,7 +157,7 @@ handle_tokenize(uint64_t id, msgpack_object input)
 static void
 handle_embeddings(uint64_t id, msgpack_object input)
 {
-    if (input.type == MSGPACK_OBJECT_NIL)
+    if (input.type != MSGPACK_OBJECT_ARRAY)
         return;
 
     size_t size = input.via.array.size;
@@ -345,10 +345,14 @@ dispatch_request(msgpack_object obj)
     LOG("Skipping non embeddings request");
 }
 
-static ssize_t
-read_data(int fd, void *buffer, size_t size)
+static int
+process_data(msgpack_unpacker *unpacker, msgpack_unpacked *unpacked, int fd)
 {
-    ssize_t bytes = read(fd, buffer, size);
+    if (!msgpack_unpacker_reserve_buffer(unpacker, BUFFER_SIZE)) {
+        LOG_ERR("Failed msgpack_unpacker_reserve_buffer()");
+        return -1;
+    }
+    ssize_t bytes = read(fd, msgpack_unpacker_buffer(unpacker), BUFFER_SIZE);
 
     if (bytes < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -359,21 +363,6 @@ read_data(int fd, void *buffer, size_t size)
     }
     if (bytes == 0)
         return -2;
-
-    return bytes;
-}
-
-static int
-process_data(msgpack_unpacker *unpacker, msgpack_unpacked *unpacked, int fd)
-{
-    if (!msgpack_unpacker_reserve_buffer(unpacker, BUFFER_SIZE)) {
-        LOG_ERR("Failed msgpack_unpacker_reserve_buffer()");
-        return -1;
-    }
-    ssize_t bytes = read_data(fd, msgpack_unpacker_buffer(unpacker), BUFFER_SIZE);
-
-    if (bytes <= 0)
-        return (int)bytes;
 
     msgpack_unpacker_buffer_consumed(unpacker, bytes);
     int ret;
@@ -677,12 +666,9 @@ main(int argc, char **argv)
         if (pfd.revents & (POLLIN | POLLHUP)) {
             int ret = process_data(&unpacker, &unpacked, pfd.fd);
 
-            if (ret == -1)
-                break;
-
-            if (ret == -2) {
-                process_data(&unpacker, &unpacked, pfd.fd);
-                exit_code = EXIT_SUCCESS;
+            if (ret < 0) {
+                if (ret == -2)
+                    exit_code = EXIT_SUCCESS;
                 break;
             }
         }
