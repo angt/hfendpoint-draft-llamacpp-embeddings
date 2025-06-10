@@ -36,7 +36,7 @@ static struct {
     llama_token add_bos;
     const struct llama_vocab *vocab;
     int32_t n_embd;
-    enum llama_pooling_type pool_type;
+    enum llama_pooling_type pooling;
     int use_encode;
     struct llama_batch batch;
     llama_token *tokens;
@@ -480,7 +480,7 @@ setup_llama(void)
     ctx_params.n_threads       = worker.n_threads;
     ctx_params.n_threads_batch = worker.n_threads;
     ctx_params.embeddings      = 1;
-    ctx_params.pooling_type    = LLAMA_POOLING_TYPE_MEAN;
+    ctx_params.pooling_type    = worker.pooling;
     worker.ctx = llama_init_from_model(worker.model, ctx_params);
 
     if (!worker.ctx) {
@@ -511,7 +511,6 @@ setup_llama(void)
         LOG_ERR("Invalid n_embd: %d", worker.n_embd);
         return 1;
     }
-    worker.pool_type = llama_pooling_type(worker.ctx);
     worker.add_bos = llama_vocab_get_add_bos(worker.vocab);
 
     int has_encoder = llama_model_has_encoder(worker.model);
@@ -607,6 +606,22 @@ setup(int argc, char **argv)
     if (worker.batch_size > BATCH_SIZE) {
         LOG_ERR("HFENDPOINT_BATCH_SIZE exceeds the max allowed value of %u", BATCH_SIZE);
         return 1;
+    }
+    const char *pooling = getenv("HFENDPOINT_POOLING");
+
+    if (pooling) {
+        if (!strcmp(pooling, "MEAN")) {
+            worker.pooling = LLAMA_POOLING_TYPE_MEAN;
+        } else if (!strcmp(pooling, "CLS")) {
+            worker.pooling = LLAMA_POOLING_TYPE_CLS;
+        } else if (!strcmp(pooling, "NONE")) {
+            worker.pooling = LLAMA_POOLING_TYPE_NONE;
+        } else {
+            LOG_ERR("Unsupported pooling: %s", pooling);
+            return 1;
+        }
+    } else {
+        worker.pooling = LLAMA_POOLING_TYPE_MEAN;
     }
     worker.send.buffer.alloc = 2 * BUFFER_SIZE;
     worker.send.buffer.data = malloc(worker.send.buffer.alloc);
