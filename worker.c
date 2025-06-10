@@ -3,7 +3,6 @@
 #endif
 
 #include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
 #include <math.h>
 #include <poll.h>
@@ -445,22 +444,6 @@ parse_int(const char *val, int def)
 }
 
 static int
-set_nonblock(int fd)
-{
-    int flags = fcntl(fd, F_GETFL, 0);
-
-    if (flags == -1) {
-        LOG_ERR("Couldn't get fd flags (fd %d, errno %d)", fd, errno);
-        return 1;
-    }
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        LOG_ERR("Couldn't set fd flags (fd %d, errno %d)", fd, errno);
-        return 1;
-    }
-    return 0;
-}
-
-static int
 setup_llama(void)
 {
     struct llama_model_params model_params = llama_model_default_params();
@@ -586,9 +569,6 @@ setup(int argc, char **argv)
         LOG_ERR("Run this binary from hfendpoint");
         return 1;
     }
-    if (set_nonblock(worker.fd))
-        return 1;
-
     worker.n_threads = parse_int(getenv("HFENDPOINT_THREADS"), -1);
 
     if (worker.n_threads <= 0)
