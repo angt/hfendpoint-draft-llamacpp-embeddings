@@ -19,7 +19,6 @@
 
 #define BATCH_SIZE    128U
 #define BUFFER_SIZE  (1024U * 1024U)
-#define BUFFER_COUNT  4U
 
 #define LOG(format, ...)     fprintf(stdout, format "\n", ##__VA_ARGS__)
 #define LOG_ERR(format, ...) fprintf(stderr, format "\n", ##__VA_ARGS__)
@@ -42,17 +41,20 @@ static struct {
     struct llama_batch batch;
     llama_token *tokens;
     struct {
-        struct {
-            msgpack_sbuffer s;
-            size_t written;
-        } buffer[BUFFER_COUNT];
-        int head;
-        int tail;
-        int count;
+        msgpack_sbuffer buffer;
+        msgpack_packer packer;
+        size_t written;
+        size_t checkpoint;
     } send;
 } worker = {
     .fd = -1,
 };
+
+static void
+commit_buffer(void)
+{
+    worker.send.checkpoint = worker.send.buffer.size;
+}
 
 static void
 pack_string(msgpack_packer *packer, const char *str)
@@ -70,35 +72,11 @@ key_matches(msgpack_object key, const char *str)
            !memcmp(key.via.str.ptr, str, key.via.str.size);
 }
 
-static msgpack_packer
-get_packer(void)
-{
-    // should not happpen
-    if (worker.send.count >= BUFFER_COUNT) {
-        LOG_ERR("No send slot available (count: %d, max: %d)",
-                worker.send.count, BUFFER_COUNT);
-        return (msgpack_packer){0};
-    }
-    worker.send.buffer[worker.send.tail].written = 0;
-
-    msgpack_sbuffer *buffer = &worker.send.buffer[worker.send.tail].s;
-    msgpack_sbuffer_clear(buffer);
-
-    msgpack_packer packer;
-    msgpack_packer_init(&packer, buffer, msgpack_sbuffer_write);
-    return packer;
-}
-
-static void
-commit_buffer(void)
-{
-    worker.send.tail = (worker.send.tail + 1) % BUFFER_COUNT;
-    worker.send.count++;
-}
-
 static void
 worker_error(uint64_t id, const char *fmt, ...)
 {
+    worker.send.buffer.size = worker.send.checkpoint;
+
     char error[1024];
     va_list ap;
 
@@ -110,16 +88,13 @@ worker_error(uint64_t id, const char *fmt, ...)
         LOG_ERR("Failed vsnprintf()");
         return;
     }
-    msgpack_packer packer = get_packer();
+    msgpack_packer *packer = &worker.send.packer;
 
-    if (!packer.data)
-        return;
-
-    msgpack_pack_map(&packer, 2);
-    pack_string(&packer, "id");
-    msgpack_pack_uint64(&packer, id);
-    pack_string(&packer, "error");
-    pack_string(&packer, error);
+    msgpack_pack_map(packer, 2);
+    pack_string(packer, "id");
+    msgpack_pack_uint64(packer, id);
+    pack_string(packer, "error");
+    pack_string(packer, error);
 
     commit_buffer();
 }
@@ -138,22 +113,24 @@ l2_norm(const float *embd, int n)
 static void
 handle_tokenize(uint64_t id, msgpack_object input)
 {
-    if (input.type == MSGPACK_OBJECT_NIL)
+    if (input.type != MSGPACK_OBJECT_ARRAY)
         return;
 
     size_t size = input.via.array.size;
-    msgpack_packer packer = get_packer();
 
-    if (!packer.data)
-        return;
+    for (size_t i = 0; i < size; i++) {
+        if (input.via.array.ptr[i].type != MSGPACK_OBJECT_STR)
+            return worker_error(id, "input[%zu] is not a string", i);
+    }
+    msgpack_packer *packer = &worker.send.packer;
 
-    msgpack_pack_map(&packer, 2);
-    pack_string(&packer, "id");
-    msgpack_pack_uint64(&packer, id);
-    pack_string(&packer, "data");
-    msgpack_pack_map(&packer, 1);
-    pack_string(&packer, "tokens");
-    msgpack_pack_array(&packer, size);
+    msgpack_pack_map(packer, 2);
+    pack_string(packer, "id");
+    msgpack_pack_uint64(packer, id);
+    pack_string(packer, "data");
+    msgpack_pack_map(packer, 1);
+    pack_string(packer, "tokens");
+    msgpack_pack_array(packer, size);
 
     for (size_t i = 0; i < size; i++) {
         msgpack_object_str text = input.via.array.ptr[i].via.str;
@@ -167,13 +144,13 @@ handle_tokenize(uint64_t id, msgpack_object input)
                     "Input sequence %zu requires %d tokens.",
                     worker.n_ctx, i, -n_tokens);
 
-        msgpack_pack_array(&packer, n_tokens);
+        msgpack_pack_array(packer, n_tokens);
 
         for (int j = 0; j < n_tokens; j++)
-            msgpack_pack_uint32(&packer, worker.tokens[j]);
+            msgpack_pack_uint32(packer, worker.tokens[j]);
     }
     if (size == 0)
-        msgpack_pack_nil(&packer);
+        msgpack_pack_nil(packer);
 
     commit_buffer();
 }
@@ -185,6 +162,7 @@ handle_embeddings(uint64_t id, msgpack_object input)
         return;
 
     size_t size = input.via.array.size;
+
     struct {
         int n_tokens;
         unsigned char id;
@@ -193,31 +171,25 @@ handle_embeddings(uint64_t id, msgpack_object input)
 
     for (size_t i = 0; i < size; ++i) {
         if (input.via.array.ptr[i].type != MSGPACK_OBJECT_ARRAY)
-            return worker_error(id,
-                    "Invalid input: sequence %zu is not an array of tokens.", i);
+            return worker_error(id, "input[%zu] is not an array", i);
 
         seqs[i].n_tokens = input.via.array.ptr[i].via.array.size;
 
         if (seqs[i].n_tokens == 0)
-            return worker_error(id,
-                    "Invalid input: sequence %zu is empty.", i);
+            return worker_error(id, "input[%zu] is empty", i);
 
         if (seqs[i].n_tokens > worker.n_ctx)
-            return worker_error(id,
-                    "Input sequence %zu exceeds maximum token limit %d.", i, worker.n_ctx);
+            return worker_error(id, "input[%zu] exceeds %d", i, worker.n_ctx);
     }
-    msgpack_packer packer = get_packer();
+    msgpack_packer *packer = &worker.send.packer;
 
-    if (!packer.data)
-        return;
-
-    msgpack_pack_map(&packer, 2);
-    pack_string(&packer, "id");
-    msgpack_pack_uint64(&packer, id);
-    pack_string(&packer, "data");
-    msgpack_pack_map(&packer, 1);
-    pack_string(&packer, "embeddings");
-    msgpack_pack_array(&packer, size);
+    msgpack_pack_map(packer, 2);
+    pack_string(packer, "id");
+    msgpack_pack_uint64(packer, id);
+    pack_string(packer, "data");
+    msgpack_pack_map(packer, 1);
+    pack_string(packer, "embeddings");
+    msgpack_pack_array(packer, size);
 
     llama_kv_self_seq_rm(worker.ctx, -1, -1, -1);
 
@@ -276,7 +248,7 @@ handle_embeddings(uint64_t id, msgpack_object input)
         int rc = worker.use_encode ? llama_encode(worker.ctx, worker.batch)
                                    : llama_decode(worker.ctx, worker.batch);
         if (rc != 0)
-            return worker_error(id, "Batch failed, rc=%d.", rc);
+            return worker_error(id, "Batch failed with error %d", rc);
 
         if (fake_seq_id >= 0)
             llama_kv_self_seq_rm(worker.ctx, fake_seq_id, -1, -1);
@@ -289,13 +261,13 @@ handle_embeddings(uint64_t id, msgpack_object input)
             float inorm = 1.0 / l2_norm(embd, worker.n_embd);
 
             if (embd) {
-                msgpack_pack_array(&packer, worker.n_embd);
+                msgpack_pack_array(packer, worker.n_embd);
                 for (int j = 0; j < worker.n_embd; j++) {
-                    msgpack_pack_float(&packer, inorm * embd[j]);
+                    msgpack_pack_float(packer, inorm * embd[j]);
                 }
             } else {
                 LOG_ERR("Failed llama_get_embeddings_seq() (req %" PRIu64 ")", id);
-                msgpack_pack_nil(&packer);
+                msgpack_pack_nil(packer);
             }
             llama_kv_self_seq_rm(worker.ctx, seqs[k].id, -1, -1);
             seqs[k].ok = 0;
@@ -429,49 +401,30 @@ process_data(msgpack_unpacker *unpacker, msgpack_unpacked *unpacked, int fd)
 }
 
 static void
-update_buffer(size_t written)
-{
-    msgpack_sbuffer *buffer = &worker.send.buffer[worker.send.head].s;
-
-    if (written >= buffer->size)
-        written = 0;
-
-    if (written == 0) {
-        msgpack_sbuffer_clear(buffer);
-        worker.send.buffer[worker.send.head].written = 0;
-        worker.send.head = (worker.send.head + 1) % BUFFER_COUNT;
-        worker.send.count--;
-    } else {
-        worker.send.buffer[worker.send.head].written = written;
-    }
-}
-
-static void
 send_buffer(void)
 {
-    if (!worker.send.count)
+    size_t written = worker.send.written;
+
+    if (worker.send.buffer.size <= written)
         return;
 
-    msgpack_sbuffer *buffer = &worker.send.buffer[worker.send.head].s;
-    size_t written = worker.send.buffer[worker.send.head].written;
-
-    if (written >= buffer->size)
-        return update_buffer(0);
-
-    size_t size = buffer->size - written;
-    const char *data = buffer->data + written;
+    size_t size = worker.send.buffer.size - written;
+    const char *data = worker.send.buffer.data + written;
     ssize_t ret = write(worker.fd, data, size);
 
     if (ret == -1) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            return;
-        LOG_ERR("Failed write() (errno %d)", errno);
-        return update_buffer(0);
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            LOG_ERR("Failed write() (errno %d)", errno);
+        // TODO: LATER
+        return;
     }
-    if (ret == 0)
-        return update_buffer(0);
+    worker.send.written += ret;
 
-    return update_buffer(written + ret);
+    if (worker.send.written >= worker.send.buffer.size) {
+        msgpack_sbuffer_clear(&worker.send.buffer);
+        worker.send.written = 0;
+        worker.send.checkpoint = 0;
+    }
 }
 
 static int
@@ -655,23 +608,22 @@ setup(int argc, char **argv)
         LOG_ERR("HFENDPOINT_BATCH_SIZE exceeds the max allowed value of %u", BATCH_SIZE);
         return 1;
     }
-    for (size_t i = 0; i < BUFFER_COUNT; i++) {
-        worker.send.buffer[i].s.alloc = BUFFER_SIZE;
-        worker.send.buffer[i].s.data = malloc(BUFFER_SIZE);
+    worker.send.buffer.alloc = 2 * BUFFER_SIZE;
+    worker.send.buffer.data = malloc(worker.send.buffer.alloc);
 
-        if (!worker.send.buffer[i].s.data) {
-            LOG_ERR("Failed malloc()");
-            return 1;
-        }
+    if (!worker.send.buffer.data) {
+        LOG_ERR("Failed malloc()");
+        return 1;
     }
+    msgpack_packer_init(&worker.send.packer, &worker.send.buffer, msgpack_sbuffer_write);
+
     return setup_llama();
 }
 
 static int
 cleanup(int exit_code)
 {
-    for (size_t i = 0; i < BUFFER_COUNT; i++)
-        msgpack_sbuffer_destroy(&worker.send.buffer[i].s);
+    msgpack_sbuffer_destroy(&worker.send.buffer);
 
     if (worker.batch.token)
         llama_batch_free(worker.batch);
@@ -708,10 +660,10 @@ main(int argc, char **argv)
         struct pollfd pfd = {
             .fd = worker.fd,
         };
-        if (worker.send.count <= (BUFFER_COUNT - 2))
+        if (worker.send.buffer.alloc - worker.send.buffer.size >= BUFFER_SIZE)
             pfd.events |= POLLIN;
 
-        if (worker.send.count > 0)
+        if (worker.send.buffer.size > worker.send.written)
             pfd.events |= POLLOUT;
 
         int ret = poll(&pfd, 1, -1);
