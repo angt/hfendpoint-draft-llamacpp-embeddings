@@ -574,8 +574,8 @@ setup(int argc, char **argv)
             worker.pooling = LLAMA_POOLING_TYPE_MEAN;
         } else if (!strcmp(pooling, "CLS")) {
             worker.pooling = LLAMA_POOLING_TYPE_CLS;
-        } else if (!strcmp(pooling, "NONE")) {
-            worker.pooling = LLAMA_POOLING_TYPE_NONE;
+        } else if (!strcmp(pooling, "LAST")) {
+            worker.pooling = LLAMA_POOLING_TYPE_LAST;
         } else {
             LOG_ERR("Unsupported pooling: %s", pooling);
             return 1;
