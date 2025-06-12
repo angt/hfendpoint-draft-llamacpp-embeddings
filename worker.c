@@ -21,6 +21,11 @@
 #define LOG(format, ...)     fprintf(stdout, format "\n", ##__VA_ARGS__)
 #define LOG_ERR(format, ...) fprintf(stderr, format "\n", ##__VA_ARGS__)
 
+typedef void (*pooling_t) (uint64_t, int);
+
+static void pooling_last  (uint64_t, int);
+static void pooling_mean  (uint64_t, int);
+
 static struct {
     char name[128];
     const char *gguf;
@@ -32,11 +37,13 @@ static struct {
     int n_threads;
     llama_token add_bos;
     const struct llama_vocab *vocab;
-    int32_t n_embd;
-    enum llama_pooling_type pooling;
+    int n_embd;
+    pooling_t pooling;
+    enum llama_pooling_type pooling_type;
     int use_encode;
     struct llama_batch batch;
     llama_token *tokens;
+    float *embd;
     struct {
         msgpack_sbuffer buffer;
         msgpack_packer packer;
@@ -101,7 +108,7 @@ l2_norm(const float *embd, int n)
 {
     float sum_sq = 0.0f;
 
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < n; i++) {
         sum_sq += embd[i] * embd[i];
     }
     return sqrtf(sum_sq);
@@ -164,6 +171,109 @@ batch_add(llama_token token, llama_pos pos, llama_seq_id seq_id)
     worker.batch.n_tokens++;
 }
 
+/*
+static void
+pooling_llama(uint64_t id, int skip_last)
+{
+    msgpack_packer *packer = &worker.send.packer;
+
+    for (int pos = 0; pos < worker.batch.n_tokens; pos++) {
+        int seq_id = worker.batch.seq_id[pos][0];
+
+        if (pos == worker.batch.n_tokens - 1) {
+            if (skip_last)
+                break;
+        } else if (seq_id == worker.batch.seq_id[pos + 1][0]) {
+            continue;
+        }
+        float *embd = llama_get_embeddings_seq(worker.ctx, seq_id);
+
+        if (embd) {
+            float inorm = 1.0 / l2_norm(embd, worker.n_embd);
+
+            msgpack_pack_array(packer, worker.n_embd);
+
+            for (int j = 0; j < worker.n_embd; j++)
+                msgpack_pack_float(packer, inorm * embd[j]);
+        } else {
+            LOG_ERR("Failed llama_get_embeddings_seq() (req %" PRIu64 ")", id);
+            msgpack_pack_nil(packer);
+        }
+        llama_kv_self_seq_rm(worker.ctx, seq_id, -1, -1);
+    }
+}
+*/
+
+static void
+pooling_last(uint64_t id, int skip_last)
+{
+    msgpack_packer *packer = &worker.send.packer;
+
+    for (int pos = 0; pos < worker.batch.n_tokens; pos++) {
+        int seq_id = worker.batch.seq_id[pos][0];
+
+        if (pos == worker.batch.n_tokens - 1) {
+            if (skip_last)
+                break;
+        } else if (seq_id == worker.batch.seq_id[pos + 1][0]) {
+            continue;
+        }
+        float *embd = llama_get_embeddings_ith(worker.ctx, pos);
+
+        if (embd) {
+            float inorm = 1.0 / l2_norm(embd, worker.n_embd);
+
+            msgpack_pack_array(packer, worker.n_embd);
+
+            for (int j = 0; j < worker.n_embd; j++)
+                msgpack_pack_float(packer, inorm * embd[j]);
+        } else {
+            LOG_ERR("Failed llama_get_embeddings_ith() (req %" PRIu64 ")", id);
+            msgpack_pack_nil(packer);
+        }
+        llama_kv_self_seq_rm(worker.ctx, seq_id, -1, -1);
+    }
+}
+
+static void
+pooling_mean(uint64_t id, int skip_last)
+{
+    msgpack_packer *packer = &worker.send.packer;
+
+    for (int pos = 0; pos < worker.batch.n_tokens; pos++) {
+        int seq_id = worker.batch.seq_id[pos][0];
+
+        float *embd = llama_get_embeddings_ith(worker.ctx, pos);
+
+        if (embd) {
+            for (int j = 0; j < worker.n_embd; j++)
+                worker.embd[j] += embd[j];
+        } else {
+            LOG_ERR("Failed llama_get_embeddings_ith() (req %" PRIu64 ")", id);
+        }
+        if (pos == worker.batch.n_tokens - 1) {
+            if (skip_last)
+                break;
+        } else if (seq_id == worker.batch.seq_id[pos + 1][0]) {
+            continue;
+        }
+        size_t count = worker.batch.pos[pos] + 1;
+
+        for (int j = 0; j < worker.n_embd; j++)
+            worker.embd[j] /= count;
+
+        float inorm = 1.0 / l2_norm(worker.embd, worker.n_embd);
+
+        msgpack_pack_array(packer, worker.n_embd);
+
+        for (int j = 0; j < worker.n_embd; j++)
+            msgpack_pack_float(packer, inorm * worker.embd[j]);
+
+        memset(worker.embd, 0, worker.n_embd * sizeof(float));
+        llama_kv_self_seq_rm(worker.ctx, seq_id, -1, -1);
+    }
+}
+
 static void
 handle_embeddings(uint64_t id, msgpack_object input)
 {
@@ -202,7 +312,6 @@ handle_embeddings(uint64_t id, msgpack_object input)
     for (int i = 0; i < size;) {
         worker.batch.n_tokens = 0;
 
-        int max_seq_id = 0;
         int skip_seq_id = processed ? seq_id : -1;
 
         if (!processed)
@@ -211,9 +320,6 @@ handle_embeddings(uint64_t id, msgpack_object input)
         while (worker.batch.n_tokens < worker.n_batch) {
             msgpack_object_array seq = input.via.array.ptr[i].via.array;
             batch_add(seq.ptr[processed].via.u64, processed, seq_id);
-
-            if (max_seq_id < seq_id)
-                max_seq_id = seq_id;
 
             if (seq.size == ++processed) {
                 processed = 0;
@@ -227,42 +333,12 @@ handle_embeddings(uint64_t id, msgpack_object input)
                     break;
             }
         }
-        int fake_seq = 0;
-
-        while (worker.batch.n_tokens <= max_seq_id)
-            batch_add(0, fake_seq++, seq_id);
-
         int rc = worker.use_encode ? llama_encode(worker.ctx, worker.batch)
                                    : llama_decode(worker.ctx, worker.batch);
         if (rc != 0)
             return worker_error(id, "Batch failed with error %d", rc);
 
-        if (fake_seq)
-            llama_kv_self_seq_rm(worker.ctx, seq_id, -1, -1);
-
-        for (int pos = 0; pos < worker.batch.n_tokens; pos++) {
-            int pos_seq_id = worker.batch.seq_id[pos][0];
-
-            if (pos == worker.batch.n_tokens - 1) {
-                if (processed || fake_seq)
-                    break;
-            } else if (pos_seq_id == worker.batch.seq_id[pos + 1][0]) {
-                continue;
-            }
-            float *embd = llama_get_embeddings_seq(worker.ctx, pos_seq_id);
-            float inorm = 1.0 / l2_norm(embd, worker.n_embd);
-
-            if (embd) {
-                msgpack_pack_array(packer, worker.n_embd);
-                for (int j = 0; j < worker.n_embd; j++) {
-                    msgpack_pack_float(packer, inorm * embd[j]);
-                }
-            } else {
-                LOG_ERR("Failed llama_get_embeddings_seq() (req %" PRIu64 ")", id);
-                msgpack_pack_nil(packer);
-            }
-            llama_kv_self_seq_rm(worker.ctx, pos_seq_id, -1, -1);
-        }
+        worker.pooling(id, processed);
     }
     commit_buffer();
 }
@@ -444,7 +520,7 @@ setup_llama(void)
     ctx_params.n_threads       = worker.n_threads;
     ctx_params.n_threads_batch = worker.n_threads;
     ctx_params.embeddings      = 1;
-    ctx_params.pooling_type    = worker.pooling;
+    ctx_params.pooling_type    = worker.pooling_type;
     worker.ctx = llama_init_from_model(worker.model, ctx_params);
 
     if (!worker.ctx) {
@@ -473,6 +549,12 @@ setup_llama(void)
 
     if (worker.n_embd <= 0) {
         LOG_ERR("Invalid n_embd: %d", worker.n_embd);
+        return 1;
+    }
+    worker.embd = calloc(worker.n_embd, sizeof(float));
+
+    if (!worker.embd) {
+        LOG_ERR("Couldn't alloc %d floats", worker.n_embd);
         return 1;
     }
     worker.add_bos = llama_vocab_get_add_bos(worker.vocab);
@@ -567,17 +649,21 @@ setup(int argc, char **argv)
 
     if (pooling) {
         if (!strcmp(pooling, "MEAN")) {
-            worker.pooling = LLAMA_POOLING_TYPE_MEAN;
-        } else if (!strcmp(pooling, "CLS")) {
-            worker.pooling = LLAMA_POOLING_TYPE_CLS;
+            worker.pooling = pooling_mean;
+            worker.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    //  } else if (!strcmp(pooling, "CLS")) {
+    //      worker.pooling = pooling_llama;
+    //      worker.pooling_type = LLAMA_POOLING_TYPE_CLS;
         } else if (!strcmp(pooling, "LAST")) {
-            worker.pooling = LLAMA_POOLING_TYPE_LAST;
+            worker.pooling = pooling_last;
+            worker.pooling_type = LLAMA_POOLING_TYPE_NONE;
         } else {
             LOG_ERR("Unsupported pooling: %s", pooling);
             return 1;
         }
     } else {
-        worker.pooling = LLAMA_POOLING_TYPE_MEAN;
+        worker.pooling = pooling_mean;
+        worker.pooling_type = LLAMA_POOLING_TYPE_NONE;
     }
     worker.send.buffer.alloc = 2 * BUFFER_SIZE;
     worker.send.buffer.data = malloc(worker.send.buffer.alloc);
@@ -607,6 +693,9 @@ cleanup(int exit_code)
 
     if (worker.model)
         llama_model_free(worker.model);
+
+    if (worker.embd)
+        free(worker.embd);
 
     llama_backend_free();
     return exit_code;
