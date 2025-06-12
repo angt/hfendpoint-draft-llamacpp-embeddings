@@ -204,7 +204,6 @@ handle_embeddings(uint64_t id, msgpack_object input)
 
         int max_seq_id = 0;
         int skip_seq_id = processed ? seq_id : -1;
-        int fake_seq_id = -1;
 
         if (!processed)
             seq_id = 0;
@@ -224,31 +223,28 @@ handle_embeddings(uint64_t id, msgpack_object input)
                 } else if (skip_seq_id == ++seq_id) {
                     seq_id++;
                 }
-                if (size == ++i) {
-                    int pos = 0;
-
-                    while (worker.batch.n_tokens <= max_seq_id) {
-                        batch_add(0, pos++, seq_id);
-                    }
-                    if (pos)
-                        fake_seq_id = seq_id;
+                if (size == ++i)
                     break;
-                }
             }
         }
+        int fake_seq = 0;
+
+        while (worker.batch.n_tokens <= max_seq_id)
+            batch_add(0, fake_seq++, seq_id);
+
         int rc = worker.use_encode ? llama_encode(worker.ctx, worker.batch)
                                    : llama_decode(worker.ctx, worker.batch);
         if (rc != 0)
             return worker_error(id, "Batch failed with error %d", rc);
 
-        if (fake_seq_id >= 0)
-            llama_kv_self_seq_rm(worker.ctx, fake_seq_id, -1, -1);
+        if (fake_seq)
+            llama_kv_self_seq_rm(worker.ctx, seq_id, -1, -1);
 
         for (int pos = 0; pos < worker.batch.n_tokens; pos++) {
             int pos_seq_id = worker.batch.seq_id[pos][0];
 
             if (pos == worker.batch.n_tokens - 1) {
-                if (processed || pos_seq_id == fake_seq_id)
+                if (processed || fake_seq)
                     break;
             } else if (pos_seq_id == worker.batch.seq_id[pos + 1][0]) {
                 continue;
