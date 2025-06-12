@@ -153,6 +153,18 @@ handle_tokenize(uint64_t id, msgpack_object input)
 }
 
 static void
+batch_add(llama_token token, llama_pos pos, llama_seq_id seq_id)
+{
+    size_t n = worker.batch.n_tokens;
+    worker.batch.token[n] = token;
+    worker.batch.pos[n] = pos;
+    worker.batch.n_seq_id[n] = 1;
+    worker.batch.seq_id[n][0] = seq_id;
+    worker.batch.logits[n] = 0;
+    worker.batch.n_tokens++;
+}
+
+static void
 handle_embeddings(uint64_t id, msgpack_object input)
 {
     if (input.type != MSGPACK_OBJECT_ARRAY)
@@ -197,15 +209,9 @@ handle_embeddings(uint64_t id, msgpack_object input)
         if (!processed)
             seq_id = 0;
 
-        for (int pos = 0; pos < worker.n_batch; pos++) {
+        while (worker.batch.n_tokens < worker.n_batch) {
             msgpack_object_array seq = input.via.array.ptr[i].via.array;
-
-            worker.batch.token[pos] = seq.ptr[processed].via.u64;
-            worker.batch.pos[pos] = processed;
-            worker.batch.n_seq_id[pos] = 1;
-            worker.batch.seq_id[pos][0] = seq_id;
-            worker.batch.logits[pos] = 0;
-            worker.batch.n_tokens++;
+            batch_add(seq.ptr[processed].via.u64, processed, seq_id);
 
             if (max_seq_id < seq_id)
                 max_seq_id = seq_id;
@@ -219,18 +225,13 @@ handle_embeddings(uint64_t id, msgpack_object input)
                     seq_id++;
                 }
                 if (size == ++i) {
-                    if (max_seq_id < worker.batch.n_tokens)
-                        break;
+                    int pos = 0;
 
-                    for (pos++; pos <= max_seq_id; pos++) {
-                        worker.batch.token[pos] = 0;
-                        worker.batch.pos[pos] = processed++;
-                        worker.batch.n_seq_id[pos] = 1;
-                        worker.batch.seq_id[pos][0] = seq_id;
-                        worker.batch.logits[pos] = 0;
-                        worker.batch.n_tokens++;
+                    while (worker.batch.n_tokens <= max_seq_id) {
+                        batch_add(0, pos++, seq_id);
                     }
-                    fake_seq_id = seq_id;
+                    if (pos)
+                        fake_seq_id = seq_id;
                     break;
                 }
             }
