@@ -116,7 +116,7 @@ static void
 handle_tokenize(uint64_t id, msgpack_object input)
 {
     if (input.type != MSGPACK_OBJECT_ARRAY)
-        return;
+        return worker_error(id, "Expected input to be an array");
 
     size_t size = input.via.array.size;
 
@@ -275,7 +275,7 @@ static void
 handle_embeddings(uint64_t id, msgpack_object input)
 {
     if (input.type != MSGPACK_OBJECT_ARRAY)
-        return;
+        return worker_error(id, "Expected input to be an array");
 
     size_t size = input.via.array.size;
 
@@ -356,9 +356,6 @@ extract_input(msgpack_object obj)
     if (!key_matches(kv->key, "input"))
         return nil;
 
-    if (kv->val.type != MSGPACK_OBJECT_ARRAY)
-        return nil;
-
     return kv->val;
 }
 
@@ -407,7 +404,7 @@ dispatch_request(msgpack_object obj)
     if (key_matches(name, "embeddings"))
         return handle_embeddings(id, extract_input(data));
 
-    LOG("Skipping non embeddings request");
+    LOG("Skipping unknown request");
 }
 
 static int
