@@ -3,7 +3,7 @@ FROM ubuntu:noble
 ARG TARGETOS
 ARG TARGETARCH
 
-ARG llamacpp_version=b5593
+ARG llamacpp_version=b5669
 ARG llamacpp_native=ON
 ARG llamacpp_cpu_arm_arch=native
 ARG llamacpp_backend_dl=OFF
