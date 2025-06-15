@@ -174,11 +174,7 @@ run_batch(void)
 
     int rc = llama_decode(worker.ctx, worker.batch);
 
-    if (rc != 0)
-        LOG_ERR("TODO");
-
     msgpack_packer *packer = &worker.send.packer;
-
     int last_seq_id = -1;
 
     for (int i = 0; i < worker.batch.n_tokens; i++) {
@@ -189,7 +185,7 @@ run_batch(void)
 
         last_seq_id = seq_id;
 
-        float *embd = llama_get_embeddings_seq(worker.ctx, seq_id);
+        float *embd = rc ? NULL : llama_get_embeddings_seq(worker.ctx, seq_id);
 
         if (!embd) {
             msgpack_pack_nil(packer);
