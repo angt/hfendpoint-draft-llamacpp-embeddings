@@ -495,27 +495,17 @@ parse_int(const char *val, int def)
 }
 
 static int
-setup_llama(void)
+setup_llama_context(void)
 {
-    struct llama_model_params model_params = llama_model_default_params();
-    model_params.use_mmap = 1;
-    worker.model = llama_model_load_from_file(worker.gguf, model_params);
-
-    if (!worker.model) {
-        LOG_ERR("Couldn't load model `%s`", worker.gguf);
-        return 1;
-    }
-    llama_model_desc(worker.model, worker.name, sizeof(worker.name) - 1);
-
-    struct llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx           = worker.n_ctx;
-    ctx_params.n_batch         = worker.n_batch;
-    ctx_params.n_ubatch        = worker.n_batch;
-    ctx_params.n_threads       = worker.n_threads;
-    ctx_params.n_threads_batch = worker.n_threads;
-    ctx_params.embeddings      = 1;
-    ctx_params.pooling_type    = worker.pooling_type;
-    worker.ctx = llama_init_from_model(worker.model, ctx_params);
+    struct llama_context_params params = llama_context_default_params();
+    params.n_ctx           = worker.n_ctx;
+    params.n_batch         = worker.n_batch;
+    params.n_ubatch        = worker.n_batch;
+    params.n_threads       = worker.n_threads;
+    params.n_threads_batch = worker.n_threads;
+    params.embeddings      = 1;
+    params.pooling_type    = worker.pooling_type;
+    worker.ctx = llama_init_from_model(worker.model, params);
 
     if (!worker.ctx) {
         LOG_ERR("Couldn't create llama context");
@@ -523,8 +513,8 @@ setup_llama(void)
     }
     worker.n_ctx = llama_n_ctx(worker.ctx);
 
-    if (worker.n_ctx <= 0 || worker.n_ctx != ctx_params.n_ctx) {
-        LOG_ERR("Invalid n_ctx: %d (params: %d)", worker.n_ctx, ctx_params.n_ctx);
+    if (worker.n_ctx <= 0 || worker.n_ctx != params.n_ctx) {
+        LOG_ERR("Invalid n_ctx: %d (params: %d)", worker.n_ctx, params.n_ctx);
         return 1;
     }
     worker.n_batch = llama_n_batch(worker.ctx);
@@ -571,6 +561,47 @@ setup_llama(void)
         return 1;
     }
     return 0;
+}
+
+static int
+setup_llama_model(void)
+{
+    struct llama_model_params params = llama_model_default_params();
+    params.use_mmap = 1;
+    worker.model = llama_model_load_from_file(worker.gguf, params);
+
+    if (!worker.model) {
+        LOG_ERR("Couldn't load model `%s`", worker.gguf);
+        return 1;
+    }
+    llama_model_desc(worker.model, worker.name, sizeof(worker.name) - 1);
+
+    int32_t n_ctx = llama_model_n_ctx_train(worker.model);
+
+    worker.n_ctx = parse_int(getenv("HFENDPOINT_N_CTX"), n_ctx);
+    worker.n_batch = parse_int(getenv("HFENDPOINT_N_BATCH"), n_ctx);
+
+    const char *pooling = getenv("HFENDPOINT_POOLING");
+
+    if (pooling) {
+        if (!strcmp(pooling, "MEAN")) {
+            worker.pooling = pooling_mean;
+            worker.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    //  } else if (!strcmp(pooling, "CLS")) {
+    //      worker.pooling = pooling_llama;
+    //      worker.pooling_type = LLAMA_POOLING_TYPE_CLS;
+        } else if (!strcmp(pooling, "LAST")) {
+            worker.pooling = pooling_last;
+            worker.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        } else {
+            LOG_ERR("Unsupported pooling: %s", pooling);
+            return 1;
+        }
+    } else {
+        worker.pooling = pooling_mean;
+        worker.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    }
+    return setup_llama_context();
 }
 
 static int
@@ -634,28 +665,6 @@ setup(int argc, char **argv)
         LOG_ERR("HFENDPOINT_GGUF is required");
         return 1;
     }
-    worker.n_batch = parse_int(getenv("HFENDPOINT_N_BATCH"), 512);
-    worker.n_ctx = parse_int(getenv("HFENDPOINT_N_CTX"), 128 * worker.n_batch);
-    const char *pooling = getenv("HFENDPOINT_POOLING");
-
-    if (pooling) {
-        if (!strcmp(pooling, "MEAN")) {
-            worker.pooling = pooling_mean;
-            worker.pooling_type = LLAMA_POOLING_TYPE_NONE;
-    //  } else if (!strcmp(pooling, "CLS")) {
-    //      worker.pooling = pooling_llama;
-    //      worker.pooling_type = LLAMA_POOLING_TYPE_CLS;
-        } else if (!strcmp(pooling, "LAST")) {
-            worker.pooling = pooling_last;
-            worker.pooling_type = LLAMA_POOLING_TYPE_NONE;
-        } else {
-            LOG_ERR("Unsupported pooling: %s", pooling);
-            return 1;
-        }
-    } else {
-        worker.pooling = pooling_mean;
-        worker.pooling_type = LLAMA_POOLING_TYPE_NONE;
-    }
     worker.send.buffer.alloc = 2 * BUFFER_SIZE;
     worker.send.buffer.data = malloc(worker.send.buffer.alloc);
 
@@ -665,7 +674,7 @@ setup(int argc, char **argv)
     }
     msgpack_packer_init(&worker.send.packer, &worker.send.buffer, msgpack_sbuffer_write);
 
-    return setup_llama();
+    return setup_llama_model();
 }
 
 static int
