@@ -160,7 +160,7 @@ batch_add(llama_token token, llama_pos pos, llama_seq_id seq_id)
     worker.batch.pos[n] = pos;
     worker.batch.n_seq_id[n] = 1;
     worker.batch.seq_id[n][0] = seq_id;
-    worker.batch.logits[n] = 0;
+    worker.batch.logits[n] = 1;
     worker.batch.n_tokens++;
 }
 
