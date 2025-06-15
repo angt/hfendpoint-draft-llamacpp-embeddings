@@ -39,7 +39,6 @@ static struct {
     int n_embd;
     pooling_t pooling;
     enum llama_pooling_type pooling_type;
-    int use_encode;
     struct llama_batch batch;
     llama_token *tokens;
     float *embd;
@@ -331,8 +330,8 @@ handle_embeddings(uint64_t id, msgpack_object input)
                     break;
             }
         }
-        int rc = worker.use_encode ? llama_encode(worker.ctx, worker.batch)
-                                   : llama_decode(worker.ctx, worker.batch);
+        int rc = llama_decode(worker.ctx, worker.batch);
+
         if (rc != 0)
             return worker_error(id, "Batch failed with error %d", rc);
 
@@ -562,7 +561,6 @@ setup_llama(void)
         LOG_ERR("Encoder-decoder models not supported");
         return 1;
     }
-    worker.use_encode = has_encoder;
     worker.tokens = malloc(worker.n_ctx * sizeof(llama_token));
 
     if (!worker.tokens) {
