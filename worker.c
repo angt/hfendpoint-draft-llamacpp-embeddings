@@ -35,7 +35,6 @@ static struct {
     int n_ctx;
     int n_batch;
     int n_threads;
-    llama_token add_bos;
     const struct llama_vocab *vocab;
     int n_embd;
     pooling_t pooling;
@@ -140,8 +139,7 @@ handle_tokenize(uint64_t id, msgpack_object input)
         msgpack_object_str text = input.via.array.ptr[i].via.str;
 
         int n_tokens = llama_tokenize(worker.vocab, text.ptr, text.size,
-                                      worker.tokens, worker.n_ctx,
-                                      worker.add_bos, 0);
+                                      worker.tokens, worker.n_ctx, 1, 1);
         if (n_tokens <= 0)
             return worker_error(id,
                     "Token size limit exceeded (max %d tokens). "
@@ -557,8 +555,6 @@ setup_llama(void)
         LOG_ERR("Couldn't alloc %d floats", worker.n_embd);
         return 1;
     }
-    worker.add_bos = llama_vocab_get_add_bos(worker.vocab);
-
     int has_encoder = llama_model_has_encoder(worker.model);
     int has_decoder = llama_model_has_decoder(worker.model);
 
